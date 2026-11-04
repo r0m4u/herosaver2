@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Herosaver 2 — exportar personagens do Hero Forge</title>
+<style>
+  :root { --bg: #f4f2ee; --card: #fff; --ink: #1d1d1d; --muted: #666; --line: #e2ded6; --accent: #2f8f2f; --accent2: #37a337; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 40px 20px 60px; }
+  h1 { font-size: 30px; line-height: 1.15; margin: 0 0 6px; }
+  .lead { color: var(--muted); margin: 0 0 28px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 22px 24px; margin: 0 0 18px; }
+  h2 { font-size: 18px; margin: 0 0 12px; }
+  ol { margin: 0; padding-left: 22px; }
+  li { margin: 0 0 10px; }
+  kbd { font: 13px ui-monospace, monospace; background: #f0eee9; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; padding: 1px 6px; }
+  .drag { display: inline-flex; align-items: center; gap: 8px; padding: 10px 18px; border-radius: 9px; background: var(--accent); color: #fff;
+          font-weight: 600; text-decoration: none; cursor: grab; box-shadow: 0 2px 0 rgba(0,0,0,.15); }
+  .drag:hover { background: var(--accent2); }
+  .drag.off { background: #b9b5ad; cursor: not-allowed; pointer-events: none; }
+  .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 14px 0 4px; }
+  button.copy { font: inherit; font-size: 14px; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--line); background: #faf9f6; cursor: pointer; }
+  button.copy:hover { background: #f0eee9; }
+  .note { color: var(--muted); font-size: 14px; }
+  .warn { background: #fff6e0; border: 1px solid #f0d58c; border-radius: 9px; padding: 10px 14px; font-size: 14px; margin: 12px 0 0; }
+  .hidden { display: none; }
+  ul.feat { margin: 0; padding-left: 20px; }
+  footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 28px; }
+  code { font: 14px ui-monospace, monospace; background: #f0eee9; padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Herosaver 2</h1>
+  <p class="lead">Exporta o personagem aberto no editor do Hero Forge como <strong>OBJ com cores e texturas</strong>
+    ou <strong>STL</strong>, com a mesma pose, proporções e pintura da tela. Versão {{VERSION}}.</p>
+
+  <section class="card">
+    <h2>Instalar (Chrome, Edge ou Brave)</h2>
+    <ol>
+      <li>Mostre a barra de favoritos: <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>B</kbd> (no Mac, <kbd>⌘</kbd> + <kbd>Shift</kbd> + <kbd>B</kbd>).</li>
+      <li>Arraste este botão até a barra de favoritos:
+        <div class="actions">
+          <a class="drag" id="loader" href="#" title="Arraste para a barra de favoritos">⬇ Herosaver</a>
+          <button class="copy" data-copy="loader">Copiar código</button>
+        </div>
+        <p class="note">Esse favorito sempre baixa a versão mais recente do script deste site. Se você usa a sincronização
+          da conta do navegador, ele aparece sozinho nos seus outros computadores.</p>
+        <p class="warn hidden" id="notHosted">Esta página foi aberta de um arquivo local, então o favorito acima não teria de onde
+          baixar o script. Publique a pasta no GitHub Pages (veja o README) ou use a versão offline abaixo.</p>
+      </li>
+      <li>Abra <a href="https://www.heroforge.com" target="_blank" rel="noopener">heroforge.com</a>, espere o personagem carregar
+        e clique no favorito <strong>Herosaver</strong>. Um painel abre no canto da tela: escolha OBJ ou STL e as opções, depois clique em <em>Exportar</em>.
+        Clique de novo no favorito ou aperte <kbd>Esc</kbd> para fechar o painel.</li>
+    </ol>
+    <p class="note">Se arrastar não funcionar: copie o código, aperte <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>O</kbd>
+      (gerenciador de favoritos) → <kbd>⋮</kbd> → <em>Adicionar novo favorito</em>, coloque o nome "Herosaver" e cole o código no campo URL.</p>
+  </section>
+
+  <section class="card">
+    <h2>Versão offline (sem internet)</h2>
+    <p>O mesmo script inteiro guardado dentro do favorito (cerca de {{INLINE_KB}} KB). Funciona sem depender deste site,
+      mas não se atualiza: quando sair versão nova, arraste de novo.</p>
+    <div class="actions">
+      <a class="drag" id="inline" href="#" title="Arraste para a barra de favoritos">⬇ Herosaver (offline)</a>
+      <button class="copy" data-copy="inline">Copiar código</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>O que sai</h2>
+    <ul class="feat">
+      <li><strong>OBJ</strong> num <code>.zip</code>: <code>.obj</code> com normais, UVs e cor por vértice, <code>.mtl</code> com materiais PBR
+        e uma pasta <code>textures/</code> (cor com decalques, rugosidade, metal, normal map e emissão).</li>
+      <li><strong>STL</strong> binário, pronto para o fatiador.</li>
+      <li>Escala em milímetros (a base padrão mede 25 mm). No Blender: <em>File → Import → Wavefront (.obj)</em>, nas configurações padrão.</li>
+    </ul>
+  </section>
+
+  <footer>Ideia original: <a href="https://github.com/notnullgames/Herosaver">notnullgames/Herosaver</a>. O Hero Forge vende o download oficial; use para uso pessoal.</footer>
+</main>
+<script>
+  const INLINE = {{INLINE_JSON}};
+  const scriptUrl = new URL('herosaver.js', location.href).href;
+  const hosted = /^https?:$/.test(location.protocol);
+  const loaderCode = '(()=>{const H=window.Herosaver;if(H&&H.open)return void H.open();' +
+    'fetch(' + JSON.stringify(scriptUrl) + "+'?t='+Date.now(),{cache:'no-store'})" +
+    ".then(r=>{if(!r.ok)throw Error('HTTP '+r.status);return r.text()})" +
+    '.then(t=>{(0,eval)(t);Herosaver.open()})' +
+    ".catch(e=>alert('Herosaver: não consegui carregar o script de ' + " + JSON.stringify(scriptUrl) + " + '\\n' + e.message))})()";
+  const LOADER = 'javascript:' + encodeURIComponent(loaderCode);
+  const loader = document.getElementById('loader');
+  if (hosted) loader.href = LOADER;
+  else { loader.classList.add('off'); document.getElementById('notHosted').classList.remove('hidden'); }
+  document.getElementById('inline').href = INLINE;
+  const block = e => { e.preventDefault(); alert('Não clique aqui: arraste o botão até a barra de favoritos.'); };
+  document.querySelectorAll('a.drag').forEach(a => a.addEventListener('click', block));
+  document.querySelectorAll('button.copy').forEach(b => b.addEventListener('click', async () => {
+    const text = b.dataset.copy === 'inline' ? INLINE : LOADER;
+    try { await navigator.clipboard.writeText(text); b.textContent = 'Copiado!'; }
+    catch (e) { prompt('Copie o código:', text); }
+    setTimeout(() => { b.textContent = 'Copiar código'; }, 2000);
+  }));
+</script>
+</body>
+</html>
