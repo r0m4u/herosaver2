@@ -1032,6 +1032,8 @@
     ['toe.R', 'foot.R', ['main_toeR_01']],
   ];
   const hfBase = n => String(n || '').replace(/_\d+_bind_jnt$/, '');
+  // peças da base (peanha, borda, plaquinha com nome/número)
+  const isBasePart = key => /^(base|label$|tagNumber$)/i.test(String(key || ''));
 
   function buildRig(model) {
     const withSkel = model.meshes.find(m => m.mesh.skeleton && m.skin);
@@ -1087,6 +1089,12 @@
     let nOver4 = 0;
     for (const m of model.meshes) {
       const J = new Uint8Array(m.n * 4), W = new Float32Array(m.n * 4);
+      if (isBasePart(m.key)) { // base/peanha: presa no "root", que não é animado (senão balança junto com o quadril)
+        for (let i = 0; i < m.n; i++) { J[i * 4] = 0; W[i * 4] = 1; }
+        m.rigidJoint = 0;
+        m.rigJ = J; m.rigW = W;
+        continue;
+      }
       if (m.skin) {
         const K = m.skin.k, jj = new Int16Array(K), ww = new Float64Array(K);
         for (let i = 0; i < m.n; i++) {
