@@ -34,8 +34,9 @@
 <body>
 <main>
   <h1>Herosaver 2</h1>
-  <p class="lead">Exporta o personagem aberto no editor do Hero Forge como <strong>OBJ com cores e texturas</strong>
-    ou <strong>STL</strong>, com a mesma pose, proporções e pintura da tela. Versão {{VERSION}}.</p>
+  <p class="lead">Exporta o personagem aberto no editor do Hero Forge como <strong>OBJ com texturas</strong>,
+    <strong>GLB</strong> (com ou sem esqueleto e animação) ou <strong>STL</strong>, com a mesma pose, proporções, pintura e
+    sombreado da tela. Versão {{VERSION}}.</p>
 
   <section class="card">
     <h2>Instalar (Chrome, Edge ou Brave)</h2>
@@ -52,7 +53,7 @@
           baixar o script. Publique a pasta no GitHub Pages (veja o README) ou use a versão offline abaixo.</p>
       </li>
       <li>Abra <a href="https://www.heroforge.com" target="_blank" rel="noopener">heroforge.com</a>, espere o personagem carregar
-        e clique no favorito <strong>Herosaver</strong>. Um painel abre no canto da tela: escolha OBJ ou STL e as opções, depois clique em <em>Exportar</em>.
+        e clique no favorito <strong>Herosaver</strong>. Um painel abre no canto da tela: escolha OBJ, GLB, GLB+rig ou STL e as opções, depois clique em <em>Exportar</em>.
         Clique de novo no favorito ou aperte <kbd>Esc</kbd> para fechar o painel.</li>
     </ol>
     <p class="note">Se arrastar não funcionar: copie o código, aperte <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>O</kbd>
@@ -72,10 +73,15 @@
   <section class="card">
     <h2>O que sai</h2>
     <ul class="feat">
+      <li><strong>GLB</strong> (glTF): um arquivo só, com materiais PBR completos (cor, oclusão, rugosidade, metal, normal map, emissão,
+        olhos com íris e córnea). Abre direto no Blender e no Godot, no tamanho real da miniatura. A opção <em>GLB+rig</em>
+        traz um esqueleto simplificado e uma animação "Idle" em loop.</li>
       <li><strong>OBJ</strong> num <code>.zip</code>: <code>.obj</code> com normais, UVs e cor por vértice, <code>.mtl</code> com materiais PBR
-        e uma pasta <code>textures/</code> (cor com decalques, rugosidade, metal, normal map e emissão).</li>
+        e uma pasta <code>textures/</code>. Escala em milímetros (a base padrão mede 25 mm).</li>
       <li><strong>STL</strong> binário, pronto para o fatiador.</li>
-      <li>Escala em milímetros (a base padrão mede 25 mm). No Blender: <em>File → Import → Wavefront (.obj)</em>, nas configurações padrão.</li>
+      <li><strong>Qualidade máxima</strong> (ligada por padrão): durante o export o editor carrega as texturas UHD (o dobro da
+        resolução) e recalcula a oclusão em 4K; depois volta ao normal. A oclusão do editor vai na cor e num mapa separado.</li>
+      <li><strong>Luz do editor (.hdr)</strong>: o mapa de ambiente e o sol do editor, para usar como World no Blender ou céu no Godot.</li>
     </ul>
   </section>
 

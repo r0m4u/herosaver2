@@ -1,8 +1,8 @@
 # Herosaver 2
 
 Exporta o personagem aberto no editor do [Hero Forge](https://www.heroforge.com) como
-**OBJ com cores e texturas** ou **STL**, com a mesma pose, proporções e pintura da tela.
-Funciona por um favorito (bookmarklet) no Chrome, Edge ou Brave.
+**GLB** (com ou sem esqueleto e animação), **OBJ com texturas** ou **STL**, com a mesma pose,
+proporções, pintura e sombreado da tela. Funciona por um favorito (bookmarklet) no Chrome, Edge ou Brave.
 
 A página de instalação (`index.html`) fica no GitHub Pages. Nos outros computadores,
 basta abrir essa página e arrastar o botão para a barra de favoritos, ou nem isso, se
@@ -31,7 +31,8 @@ você usa a sincronização da conta do navegador.
 1. Abra `https://SEU_USUARIO.github.io/herosaver2/` no Chrome, Edge ou Brave.
 2. Mostre a barra de favoritos (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd>) e arraste o botão **⬇ Herosaver** para ela.
 3. No heroforge.com, espere o personagem carregar e clique no favorito. Um painel abre no
-   canto: escolha **OBJ + texturas** ou **STL** e as opções, depois clique em **Exportar**.
+   canto: escolha **OBJ**, **GLB**, **GLB+rig** ou **STL** e as opções, depois clique em **Exportar**.
+   Se o favorito antigo já foi usado nesta aba, recarregue a página para pegar a versão nova.
 
 O favorito é só um carregador pequeno: a cada clique ele baixa o `herosaver.js` mais
 recente do seu GitHub Pages. Com a sincronização do navegador ligada, ele aparece sozinho
@@ -46,17 +47,41 @@ colar como URL de um favorito. Ele não se atualiza sozinho.
 
 ## O que sai
 
+- **GLB** (glTF binário), um arquivo só:
+  - materiais PBR completos: cor, oclusão + rugosidade + metal numa textura ORM, normal map,
+    emissão e transparência; os olhos saem com esclera, íris, pupila e córnea brilhante
+    (`KHR_materials_clearcoat`);
+  - tamanho real da miniatura, em metros (≈ 3,7 cm de altura), Y para cima, de frente para +Z;
+  - **GLB+rig**: esqueleto simplificado de 24 ossos e a animação "Idle" (4 s em loop).
 - **OBJ** num `.zip`:
   - `Nome.obj`: normais suaves, UVs e cor por vértice (`v x y z r g b`), útil em fatiadores
     de impressão colorida;
   - `Nome.mtl`: materiais PBR (`map_Kd`, `map_Pr`, `map_Pm`, `map_Bump`/`norm`, `map_Ke`, `map_d`);
-  - `textures/*.png`: cor com decalques, rugosidade, metal, normal map e emissão.
-- **STL** binário.
-- Escala em milímetros (a base padrão mede 25 mm). Também há centímetros (1 unidade do
-  Hero Forge = 1 cm) e polegadas. OBJ com Y para cima e o personagem de frente para +Z;
-  a opção "Z para cima" é ligada automaticamente para STL.
-- No Blender: *File → Import → Wavefront (.obj)*, nas configurações padrão. Os materiais
-  já vêm com Base Color, Metallic, Roughness e Normal ligados.
+  - `textures/*.png`: cor, rugosidade, metal, normal map, emissão e `*_ao.png` (oclusão, linear).
+  - Escala em milímetros (a base padrão mede 25 mm). Também há centímetros (1 unidade do
+    Hero Forge = 1 cm) e polegadas.
+- **STL** binário; a opção "Z para cima" é ligada automaticamente.
+- **Luz do editor (.hdr)**, num botão à parte: o mapa de ambiente do editor mais o sol, em HDR.
+
+### Para ficar igual ao editor
+
+- **Qualidade máxima** (padrão): durante o export o Herosaver liga o modo UHD do editor
+  (texturas com o dobro da resolução, até 1024 px por peça), busca os normal maps nesse
+  tamanho e recalcula a oclusão em 4096 px (o editor usa 512). No fim, o editor volta ao
+  normal sozinho. Leva uns 20 s a mais e o arquivo fica cerca de 2 vezes maior.
+- **Oclusão na cor** (padrão): o editor escurece dobras e cantos com uma oclusão calculada no
+  navegador e outra que vem pronta em cada peça. As duas vão multiplicadas na textura de cor,
+  e no GLB também vão como mapa de oclusão. No Godot, se preferir só o mapa, desligue a opção.
+- **Sombra do sol na cor** (desligada): a sombra pré-calculada do sol do editor. Só faz sentido
+  se a sua cena não tiver luz que faça sombra.
+- **Blender**: importe o **GLB** (*File → Import → glTF 2.0*). Em *Render Properties → Color
+  Management*, use *View Transform: Standard* (o padrão *AgX* desbota as cores). Para a luz do
+  editor, no *World* ligue uma *Environment Texture* com o `.hdr` (sem girar).
+  - Com o OBJ, o importador do Blender abre todas as texturas como cor: nas texturas
+    `_roughness`, `_metallic` e `_normal`, mude *Color Space* para *Non-Color*.
+- **Godot 4**: arraste o GLB para o projeto; os materiais vêm com oclusão, rugosidade, metal e
+  normal map. Para a luz do editor, use o `.hdr` num *PanoramaSkyMaterial* e ponha
+  *Environment → Sky → Rotation Y* em **90°**. O Godot não importa o verniz dos olhos.
 
 ## Usar pelo console (sem favorito)
 
@@ -70,7 +95,15 @@ saveStl()                        // STL (mm, Z para cima)
 saveJson()                       // configuração do personagem
 ```
 
-Opções: `scale` (10 = mm), `base`, `noPrint`, `textures`, `vertexColors`, `normals`, `zUp`.
+```js
+saveGlb()                        // GLB estático, qualidade máxima
+saveGlb({ rig: true })           // GLB com esqueleto + animação idle
+saveGlb({ maxQuality: false, aoInColor: false })
+saveHdr()                        // luz do editor (.hdr)
+```
+
+Opções: `scale` (10 = mm; no GLB, 0.01 = metros), `base`, `noPrint`, `maxQuality`, `aoInColor`,
+`sunInColor`, `textures`, `vertexColors`, `normals`, `zUp`, `rig`.
 
 ## Atualizar o código
 
@@ -93,10 +126,21 @@ Opções: `scale` (10 = mm), `base`, `noPrint`, `textures`, `vertexColors`, `nor
 
 O Hero Forge usa uma engine própria (fork do three.js). O script reproduz na CPU o shader
 de vértice do site: ossos lidos da mesma textura da GPU, os mesmos morphs e normais. Ele
-lê da GPU os atlas de cor/física/emissão e os normal maps. Ficam de fora as peças marcadas
-como não imprimíveis (há uma opção para incluí-las) e as malhas que a câmera não desenha.
+lê da GPU os atlas de cor/física/emissão/oclusão e os normal maps e refaz a conta do shader
+de pintura do site para gerar texturas PBR comuns (inclusive a cor procedural dos olhos).
+Ficam de fora as peças marcadas como não imprimíveis (há uma opção para incluí-las) e as
+malhas que a câmera não desenha.
 
-- Translucidez, sheen e a oclusão pré-calculada do site não têm equivalente no `.mtl`.
+- A malha é a mesma que o editor mostra. A versão de alta resolução usada na impressão é o
+  produto que o Hero Forge vende, e o Herosaver não a busca.
+- O "sheen" do site (um reflexo fraco nas bordas) não é exportado: o sheen do glTF e do
+  Blender é bem mais largo e deixava os tecidos escuros acinzentados.
+- A profundidade da íris (efeito de paralaxe do shader do olho) não tem equivalente em PBR.
+- A translucidez (pedras, gelo etc.) vira transparência parcial; a refração não é exportada.
+- O normal map do rosto fica na resolução do editor (ele é montado na GPU a partir das
+  expressões).
+- No Blender o modelo sai um pouco mais claro que no editor nas áreas escuras: o editor
+  reduz o reflexo do ambiente onde há oclusão, e o Cycles/Eevee não.
 - `map_Bump` com normal map é a convenção do Blender; alguns programas antigos leem
   `map_Bump` como mapa de altura.
 - Se o Hero Forge mudar a engine de novo, os nomes internos (`CK.display`, `colorAtlasMap`

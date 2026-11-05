@@ -1,6 +1,6 @@
 /*!
  * Herosaver 2 — exporta o personagem atual do Hero Forge como OBJ (com MTL, texturas PBR
- * e cores por vértice, tudo num .zip) ou STL.
+ * e cores por vértice, tudo num .zip), GLB (glTF, com ou sem rig) ou STL.
  *
  * Funciona com o editor atual do Hero Forge (engine própria "RenderKit/CreationKit").
  * Ideia original: notnullgames/Herosaver (MIT). Esta versão foi reescrita do zero porque
@@ -10,23 +10,28 @@
  * Uso (no console ou via bookmarklet), com a página do Hero Forge aberta:
  *   Herosaver.open()          -> painel com as opções (é o que o bookmarklet faz)
  *   saveObj()                 -> <Nome>.zip com .obj + .mtl + texturas
- *   saveObj({ textures: false, vertexColors: true })
+ *   saveGlb()                 -> <Nome>.glb (metros, tamanho real); saveGlb({ rig: true }) com esqueleto + idle
  *   saveStl()                 -> <Nome>.stl (binário, Z para cima, milímetros)
+ *   saveHdr()                 -> <Nome>_luz_editor.hdr (luz do editor, para Blender/Godot)
  *   saveJson()                -> configuração do personagem (.json)
  *
- * Opções (saveObj / saveStl):
- *   scale         fator de escala (padrão 10 -> milímetros; 1 unidade do Hero Forge = 1 cm)
+ * Opções (saveObj / saveGlb / saveStl):
+ *   scale         fator de escala (padrão 10 -> milímetros; 1 unidade do Hero Forge = 1 cm; GLB: 0,01 = metros)
  *   base          incluir a base/peanha (padrão true)
  *   noPrint       incluir peças que o Hero Forge marca como "não imprimíveis" (padrão false)
+ *   maxQuality    texturas UHD e oclusão 4K durante o export (padrão true)
+ *   aoInColor     multiplicar a oclusão do editor na textura de cor (padrão true)
+ *   sunInColor    multiplicar também a sombra do sol pré-calculada (padrão false)
  *   textures      (OBJ) exportar texturas de cor/rugosidade/metal/normal/emissão (padrão true)
  *   vertexColors  (OBJ) gravar a cor em cada vértice "v x y z r g b" (padrão true)
  *   normals       (OBJ) gravar normais suaves "vn" (padrão true)
  *   zUp           girar para Z para cima (padrão: false no OBJ, true no STL)
+ *   rig           (GLB) esqueleto simplificado de 24 articulações + animação "Idle" em loop
  */
 (() => {
   'use strict';
 
-  const VERSION = '2.0.0';
+  const VERSION = '2.1.0';
   const TAG = '[Herosaver]';
   const log = (...a) => console.log(TAG, ...a);
   const warn = (...a) => console.warn(TAG, ...a);
@@ -278,7 +283,7 @@
   }
 
   // ------------------------------------------------------------------ pose (réplica do shader de vértice na CPU)
-  function poseMesh(entry, E, gl) {
+  function poseMesh(entry, E, gl, wantRig) {
     const mesh = entry.mesh, g = mesh.geometry, A = g.attributes;
     const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
     const info = shaderInfo(mesh, mats[0], gl);
@@ -303,6 +308,8 @@
     if (!info.skinned) { A4 = M4.mul(E, Mw); C3 = M4.normal3(A4); }
     const mn = [0, 0, 0], S = new Float64Array(12);
     const nb = bones ? bones.length : 0;
+    const K = info.skinned ? info.skinSlots : 0;
+    const skinRec = wantRig && K ? { k: K, idx: new Uint16Array(n * K), w: new Float32Array(n * K) } : null;
     for (let i = 0; i < n; i++) {
       let x = P[i * 3], y = P[i * 3 + 1], z = P[i * 3 + 2];
       // O site esconde um cubo "sentinela" de ±3000 unidades em algumas peças (o personagem mede ~5): ignora.
@@ -337,6 +344,7 @@
           if (b < 0 || b + 12 > nb) continue;
           for (let k = 0; k < 12; k++) S[k] += bones[b + k] * w;
           sum += w;
+          if (skinRec) { skinRec.idx[i * K + s] = a[o]; skinRec.w[i * K + s] = w; }
         }
         if (!(sum > 0)) continue; // o shader geraria NaN: vértice some
         const inv = 1 / sum;
@@ -397,7 +405,7 @@
       tris.push({ mat, idx: arr });
     }
     if (vote < 0) for (const t of tris) for (let k = 0; k < t.idx.length; k += 3) { const tmp = t.idx[k + 1]; t.idx[k + 1] = t.idx[k + 2]; t.idx[k + 2] = tmp; }
-    return { key: entry.key, fin: entry.fin, mesh, n, pos: outP, nrm: outN, uv: A.uv ? dense(A.uv, 2) : null, tris, info, flipped: vote < 0 };
+    return { key: entry.key, fin: entry.fin, mesh, n, pos: outP, nrm: outN, uv: A.uv ? dense(A.uv, 2) : null, tris, info, flipped: vote < 0, skin: skinRec };
   }
 
   // Referencial de exportação: tira a rotação de "vitrine" do personagem, mas mantém o espelho (escala -1 em X)
@@ -418,11 +426,11 @@
     const E = exportFrame(CK, opts);
     const entries = collectMeshes(CK, opts);
     if (!entries.length) throw new Error('nenhuma malha visível encontrada.');
-    const meshes = entries.map(e => poseMesh(e, E, gl));
+    const meshes = entries.map(e => poseMesh(e, E, gl, !!opts.rig));
     let nt = 0, nv = 0;
     for (const m of meshes) { nv += m.n; for (const t of m.tris) nt += t.idx.length / 3; }
     log(`pose calculada: ${meshes.length} malhas, ${nv} vértices, ${nt} triângulos`);
-    return { CK, renderer, gl, meshes, triCount: nt };
+    return { CK, renderer, gl, meshes, triCount: nt, E };
   }
 
   // ------------------------------------------------------------------ texturas (lidas direto da GPU)
@@ -531,10 +539,14 @@
   }
 
   function uniformTex(mat, name) { const u = mat.uniforms && mat.uniforms[name]; return u && u.value && u.value.isTexture ? u.value : null; }
+  const uNum = (u, k, d) => (u[k] && typeof u[k].value === 'number' ? u[k].value : d);
+  const uVec = (u, k) => { const v = u[k] && u[k].value; return v ? [v.x !== undefined ? v.x : v.r, v.y !== undefined ? v.y : v.g, v.z !== undefined ? v.z : v.b] : [0, 0, 0]; };
 
-  // Prepara um registro por material: região no atlas e as texturas de cor/física/emissão/normal.
+  // Prepara um registro por material: região no atlas, texturas (cor/física/emissão/oclusão/normal) e os
+  // parâmetros que o shader do editor usa para combinar tudo.
   function collectMaterials(model) {
     const recs = new Map(), used = new Set();
+    const blended = (window.CK && CK.display && CK.display._blendedNormalMaps) || new Map();
     // peças primeiro (o material ganha o nome da peça dona), depois as tiras de emenda
     const ordered = model.meshes.filter(m => !m.fin).concat(model.meshes.filter(m => m.fin));
     for (const m of ordered) for (const t of m.tris) {
@@ -545,24 +557,302 @@
       while (used.has(name)) name = base + '_' + (k++);
       used.add(name);
       const r = u.uvPosScl && u.uvPosScl.value;
-      recs.set(mat, {
-        name,
+      const normal = uniformTex(mat, 'normalMap');
+      let part = null;
+      for (let o = m.mesh; o && !part; o = o.parent) part = o.part || null;
+      const bl = blended.get && blended.get(m.key);
+      const rec = {
+        name, slot: m.key, part,
         region: r ? [r.x, r.y, r.z, r.w] : [0, 0, 1, 1],
         color: uniformTex(mat, 'colorAtlasMap'),
         phys: uniformTex(mat, 'physicalAtlasMap'),
         emis: uniformTex(mat, 'emissiveAtlasMap'),
-        normal: uniformTex(mat, 'normalMap'),
+        occ: uniformTex(mat, 'occlusionMap'),
+        normal,
+        blend: bl && normal && bl.normalMapBlendedTarget && normal === bl.normalMapBlendedTarget.texture && bl.normalMap1 && bl.normalMap2
+          ? { n1: bl.normalMap1, n2: bl.normalMap2, t: uNum(u, 'normal2Blend', bl.normal2Blend || 0) } : null,
         flipNormalMap: u.flipNormalMap ? +u.flipNormalMap.value : 0,
-      });
+        occStrength: uNum(u, 'occlusionStrength', 1),
+        preStrength: uNum(u, 'preBakeOcclusionStrength', 1),
+        shadowStrength: uNum(u, 'shadowStrength', 1),
+        translucencyScale: uNum(u, 'translucencyScale', 1),
+        refraction: uNum(u, 'refraction', 0),
+        eye: null,
+      };
+      if (uniformTex(mat, 'irisAndDistanceTexture')) {
+        rec.eye = {
+          iris: uniformTex(mat, 'irisAndDistanceTexture'), sclera: uniformTex(mat, 'scleraTexture'),
+          iris0: uVec(u, 'iris0'), iris1: uVec(u, 'iris1'), iris2: uVec(u, 'iris2'),
+          sclera0: uVec(u, 'sclera0'), sclera1: uVec(u, 'sclera1'), sclera2: uVec(u, 'sclera2'), pupil: uVec(u, 'pupil'),
+          irisSize: uNum(u, 'irisSize', 0.35), irisRotate: uNum(u, 'irisRotate', 0), limbus: uNum(u, 'limbus', 0.18),
+          eyeGlow: uNum(u, 'eyeGlow', 0), scleraGlow: uNum(u, 'scleraGlow', 0), pupilGlow: uNum(u, 'pupilGlow', 0),
+        };
+      }
+      recs.set(mat, rec);
     }
     return recs;
   }
 
-  function sampleRegion(t, reg, u, v) { // amostra (nearest) no atlas como o shader: uv * zw + xy
-    const x = Math.max(0, Math.min(t.w - 1, Math.floor((u * reg[2] + reg[0]) * t.w)));
-    const y = Math.max(0, Math.min(t.h - 1, Math.floor((v * reg[3] + reg[1]) * t.h)));
-    const o = (y * t.w + x) * 4;
-    return [t.data[o], t.data[o + 1], t.data[o + 2], t.data[o + 3]];
+  // ------------------------------------------------------------------ "bake" do material como o editor desenha
+  // O shader do Hero Forge (lido do site) combina: cor do atlas (sRGB), física (R rugosidade, G metal, B opacidade,
+  // A máscara das ilhas UV e um reflexo de borda "sheen"), emissão, oclusão calculada no navegador (atlas próprio:
+  // R = oclusão ambiente, G = sombra do sol) e a oclusão pré-calculada da peça (canal B do normal map).
+  // Aqui tudo vira texturas PBR comuns, na resolução do atlas (ou maior, no caso dos olhos, que são procedurais).
+  const S2L = (() => { const t = new Float32Array(256); for (let i = 0; i < 256; i++) { const c = i / 255; t[i] = c < 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); } return t; })();
+  const L2S = (() => { const n = 4096, t = new Uint8Array(n + 1); for (let i = 0; i <= n; i++) { const x = i / n; t[i] = Math.round(255 * (x <= 0.0031308 ? x * 12.92 : 1.055 * Math.pow(x, 1 / 2.4) - 0.055)); } return t; })();
+  const lin2srgb = x => L2S[x <= 0 ? 0 : x >= 1 ? 4096 : Math.round(x * 4096)];
+  const srgbToLinF = x => (x < 0.04045 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4));
+  const clamp01 = x => (x < 0 ? 0 : x > 1 ? 1 : x);
+
+  // Amostragem numa textura em orientação GL (linha 0 = v=0), u/v normalizados, borda presa.
+  function bilinear(t, u, v, out) {
+    const fx = u * t.w - 0.5, fy = v * t.h - 0.5;
+    let x0 = Math.floor(fx), y0 = Math.floor(fy);
+    const ax = fx - x0, ay = fy - y0;
+    const x1 = x0 + 1 > t.w - 1 ? t.w - 1 : x0 + 1 < 0 ? 0 : x0 + 1, y1 = y0 + 1 > t.h - 1 ? t.h - 1 : y0 + 1 < 0 ? 0 : y0 + 1;
+    x0 = x0 < 0 ? 0 : x0 > t.w - 1 ? t.w - 1 : x0; y0 = y0 < 0 ? 0 : y0 > t.h - 1 ? t.h - 1 : y0;
+    const d = t.data, a = (y0 * t.w + x0) * 4, b = (y0 * t.w + x1) * 4, c = (y1 * t.w + x0) * 4, e = (y1 * t.w + x1) * 4;
+    for (let k = 0; k < 4; k++) out[k] = (d[a + k] * (1 - ax) + d[b + k] * ax) * (1 - ay) + (d[c + k] * (1 - ax) + d[e + k] * ax) * ay;
+    return out;
+  }
+  function nearest(t, u, v, out) {
+    const x = Math.max(0, Math.min(t.w - 1, Math.floor(u * t.w))), y = Math.max(0, Math.min(t.h - 1, Math.floor(v * t.h)));
+    const o = (y * t.w + x) * 4, d = t.data;
+    out[0] = d[o]; out[1] = d[o + 1]; out[2] = d[o + 2]; out[3] = d[o + 3];
+    return out;
+  }
+  function resampleGL(t, w, h) { // bilinear, mantém orientação GL
+    if (t.w === w && t.h === h) return t;
+    const out = new Uint8ClampedArray(w * h * 4), px = [0, 0, 0, 0];
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      bilinear(t, (x + 0.5) / w, (y + 0.5) / h, px);
+      const o = (y * w + x) * 4;
+      out[o] = px[0]; out[o + 1] = px[1]; out[o + 2] = px[2]; out[o + 3] = px[3];
+    }
+    return { w, h, data: out };
+  }
+
+  // Imagem do site (webp/png) -> pixels RGBA em orientação GL. Usada para buscar normal maps maiores (modo UHD).
+  async function loadImageGL(url) {
+    const resp = await fetch(url, { credentials: 'same-origin' });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status + ' ' + url);
+    const bmp = await createImageBitmap(await resp.blob(), { premultiplyAlpha: 'none', colorSpaceConversion: 'none' });
+    const cv = document.createElement('canvas'); cv.width = bmp.width; cv.height = bmp.height;
+    const cx = cv.getContext('2d', { willReadFrequently: true });
+    cx.drawImage(bmp, 0, 0);
+    const id = cx.getImageData(0, 0, bmp.width, bmp.height).data, w = bmp.width, h = bmp.height;
+    const data = new Uint8ClampedArray(w * h * 4);
+    for (let r = 0; r < h; r++) data.set(id.subarray((h - 1 - r) * w * 4, (h - r) * w * 4), r * w * 4);
+    if (bmp.close) bmp.close();
+    return { w, h, data };
+  }
+
+  // Normal map do site em resolução UHD: o editor só troca os arquivos quando a peça é recriada, então o
+  // Herosaver busca direto o arquivo "_nrml_<tamanho>" do tamanho que a peça tem no atlas UHD.
+  async function upgradedNormal(tex, rec) {
+    const src = tex && tex.image && tex.image.src;
+    const m = src && /_nrml_(\d+)\.(webp|png|jpg)/.exec(src);
+    if (!m) return null;
+    const cur = +m[1];
+    let want = cur;
+    try { want = CK.display.atlas.getSize(rec.slot) || cur; } catch (e) { /* */ }
+    const cap = rec.part && rec.part.maxRenderTextureSize;
+    if (cap) want = Math.min(want, cap);
+    if (!(want > cur)) return null;
+    try { return await loadImageGL(src.replace(/_nrml_\d+\./, `_nrml_${want}.`)); } catch (e) { warn('normal map UHD indisponível', e); return null; }
+  }
+
+  async function normalSource(rec, rd, opts, cache) {
+    const tex = rec.normal;
+    if (!tex) return null;
+    if (cache.has(tex)) return cache.get(tex);
+    let res = null;
+    if (opts.maxQuality) {
+      if (rec.blend) { // corpo: o editor mistura dois normal maps (mix linear, como SK.BlendTextures)
+        const a = (await upgradedNormal(rec.blend.n1, rec)) || rd(rec.blend.n1), b = rd(rec.blend.n2);
+        if (a && b) {
+          const w = Math.max(a.w, b.w), h = Math.max(a.h, b.h), A = resampleGL(a, w, h), B = resampleGL(b, w, h), t = rec.blend.t;
+          const data = new Uint8ClampedArray(w * h * 4);
+          for (let i = 0; i < data.length; i++) data[i] = A.data[i] * (1 - t) + B.data[i] * t;
+          res = { w, h, data };
+        }
+      } else {
+        res = await upgradedNormal(tex, rec);
+      }
+    }
+    if (!res) res = rd(tex);
+    if (res && (res.w <= 4 || res.h <= 4)) res = null;
+    cache.set(tex, res);
+    return res;
+  }
+
+  // Cor procedural do olho (mesma conta do shader "eye" do site): veias da esclera + íris + pupila + limbo.
+  function eyeColor(e, sclera, iris, u, v, out, px) {
+    let r = 0.9, g = 0.9, b = 0.9;
+    if (sclera) {
+      const s = bilinear(sclera, u, v, px)[0] / 255;
+      const w0 = clamp01(1 - 2 * s), w1 = clamp01(1 - Math.abs(-2 * s + 1)), w2 = clamp01(2 * s - 1);
+      r = e.sclera0[0] * w0 + e.sclera1[0] * w1 + e.sclera2[0] * w2;
+      g = e.sclera0[1] * w0 + e.sclera1[1] * w1 + e.sclera2[1] * w2;
+      b = e.sclera0[2] * w0 + e.sclera1[2] * w1 + e.sclera2[2] * w2;
+    }
+    let irisMask = 0, pupilMask = 0;
+    const cr = Math.cos(e.irisRotate), sr = Math.sin(e.irisRotate);
+    const x = u - 0.5, y = v - 0.5;
+    const ix = (cr * x + sr * y) / e.irisSize + 0.5, iy = (-sr * x + cr * y) / e.irisSize + 0.5;
+    if (iris && ix > 0 && iy > 0 && ix < 1 && iy < 1) {
+      const radius = 1 - bilinear(iris, ix, iy * 0.5 + 0.5, px)[0] / 255 * 2;
+      bilinear(iris, ix, iy * 0.5, px);
+      const ir = px[0] / 255, ia0 = px[3] / 255;
+      if (ia0 > 0.55) { r = e.pupil[0]; g = e.pupil[1]; b = e.pupil[2]; }
+      irisMask = Math.min(ia0 * 2, 1);
+      let irisA = clamp01(1 - Math.abs(1 - 2 * ia0));
+      const lc = Math.max(e.limbus, 1e-3);
+      const limbusBlend = clamp01(1 + (radius - 1) / lc), limbusShadow = clamp01(1 + (radius - 1) / (2 * lc));
+      irisA *= 1 - limbusBlend; irisMask *= 1 - limbusBlend;
+      const t = clamp01((ia0 - 0.55) / 0.05);
+      pupilMask = t * t * (3 - 2 * t) * (1 - limbusBlend);
+      const w0 = clamp01(1 - 2 * ir), w1 = clamp01(1 - Math.abs(-2 * ir + 1)), w2 = clamp01(2 * ir - 1), sh = 1 - limbusShadow;
+      const R = (e.iris0[0] * w0 + e.iris1[0] * w1 + e.iris2[0] * w2) * sh;
+      const G = (e.iris0[1] * w0 + e.iris1[1] * w1 + e.iris2[1] * w2) * sh;
+      const B = (e.iris0[2] * w0 + e.iris1[2] * w1 + e.iris2[2] * w2) * sh;
+      r += (R - r) * irisA; g += (G - g) * irisA; b += (B - b) * irisA;
+    }
+    out[0] = clamp01(r); out[1] = clamp01(g); out[2] = clamp01(b);
+    const sg = e.scleraGlow + (e.eyeGlow - e.scleraGlow) * irisMask;
+    out[3] = sg + (e.pupilGlow - sg) * pupilMask; // brilho do olho (emissão)
+    return out;
+  }
+
+  // Preenche os texels fora das ilhas UV com a média dos vizinhos de dentro (evita bordas escuras com mipmap).
+  function dilate(arr, inside, w, h, passes) {
+    let known = inside.slice();
+    for (let p = 0; p < passes; p++) {
+      const next = known.slice();
+      let changed = false;
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        const i = y * w + x;
+        if (known[i]) continue;
+        let s = 0, c = 0;
+        for (let dy = -1; dy <= 1; dy++) {
+          const yy = y + dy;
+          if (yy < 0 || yy >= h) continue;
+          for (let dx = -1; dx <= 1; dx++) {
+            const xx = x + dx;
+            if (xx < 0 || xx >= w || !known[yy * w + xx]) continue;
+            s += arr[yy * w + xx]; c++;
+          }
+        }
+        if (c) { arr[i] = s / c; next[i] = 1; changed = true; }
+      }
+      known = next;
+      if (!changed) break;
+    }
+    for (let i = 0; i < arr.length; i++) if (!known[i]) arr[i] = 1;
+  }
+
+  async function bakeMaterial(rec, rd, opts, normalCache) {
+    const reg = rec.region;
+    const color = rd(rec.color), phys = rd(rec.phys), emis = rd(rec.emis), occ = rd(rec.occ);
+    const nrm = await normalSource(rec, rd, opts, normalCache);
+    const ref = color || phys;
+    let w = ref ? Math.max(1, Math.round(reg[2] * ref.w)) : 64, h = ref ? Math.max(1, Math.round(reg[3] * ref.h)) : 64;
+    const eye = rec.eye, sclera = eye && rd(eye.sclera), iris = eye && rd(eye.iris);
+    if (eye) { const s = opts.maxQuality ? 1024 : 512; w = Math.max(w, s); h = Math.max(h, s); }
+    const n = w * h;
+    const col = new Uint8ClampedArray(n * 3), em = new Uint8ClampedArray(n * 3);
+    const rough = new Uint8ClampedArray(n), metal = new Uint8ClampedArray(n), opac = new Uint8ClampedArray(n);
+    const ao = new Float32Array(n), sun = new Float32Array(n), inside = new Uint8Array(n);
+    const hybrid = !(window.CK && CK.Settings && CK.Settings.occlusionCombineHybrid === false);
+    const px = [0, 0, 0, 0], px2 = [0, 0, 0, 0], ec = [0, 0, 0, 0];
+    let transparent = false, lit = false, hasAO = false;
+    for (let y = 0; y < h; y++) {
+      const v = 1 - (y + 0.5) / h; // linha 0 da imagem = topo = v alto
+      for (let x = 0; x < w; x++) {
+        const u = (x + 0.5) / w, i = y * w + x;
+        const au = reg[0] + u * reg[2], av = reg[1] + v * reg[3]; // coordenada no atlas (uv * zw + xy)
+        // ilha UV = texel que o editor pintou: alfa da cor > 0 ou algum canal da física > 0
+        // (pele/cabelo têm alfa da física 0 dentro da ilha; fora dela os dois atlas ficam 0,0,0,0)
+        let isIn = !phys && !color;
+        if (phys) {
+          nearest(phys, au, av, px);
+          isIn = px[0] > 0 || px[1] > 0 || px[2] > 0 || px[3] > 0;
+          rough[i] = px[0]; metal[i] = px[1]; opac[i] = px[2];
+        } else { rough[i] = 204; metal[i] = 0; opac[i] = 255; }
+        if (color && !isIn) isIn = nearest(color, au, av, px2)[3] > 0;
+        inside[i] = isIn ? 1 : 0;
+        if (eye) {
+          eyeColor(eye, sclera, iris, u, v, ec, px2);
+          col[i * 3] = ec[0] * 255; col[i * 3 + 1] = ec[1] * 255; col[i * 3 + 2] = ec[2] * 255;
+          rough[i] = 204; metal[i] = 0; opac[i] = 255;
+          if (ec[3] > 0) { lit = true; em[i * 3] = lin2srgb(S2L[col[i * 3]] * ec[3]); em[i * 3 + 1] = lin2srgb(S2L[col[i * 3 + 1]] * ec[3]); em[i * 3 + 2] = lin2srgb(S2L[col[i * 3 + 2]] * ec[3]); }
+        } else if (color) {
+          nearest(color, au, av, px); // mesma resolução do atlas: texel exato
+          col[i * 3] = px[0]; col[i * 3 + 1] = px[1]; col[i * 3 + 2] = px[2];
+          // translucidez (alfa da cor): aproximada como transparência parcial
+          if (isIn && px[3] < 250) opac[i] = Math.min(opac[i], 255 - (255 - px[3]) * 0.6 * rec.translucencyScale);
+        } else { col[i * 3] = col[i * 3 + 1] = col[i * 3 + 2] = 200; }
+        if (isIn && opac[i] < 250) transparent = true;
+        if (emis && !eye) {
+          nearest(emis, au, av, px);
+          em[i * 3] = px[0]; em[i * 3 + 1] = px[1]; em[i * 3 + 2] = px[2];
+          if (isIn && (px[0] > 3 || px[1] > 3 || px[2] > 3)) lit = true;
+        }
+        // oclusão: igual ao shader (mix com occlusionStrength, combinação "híbrida" com a pré-calculada, sRGB -> linear)
+        let o = 1, s = 1;
+        if (occ) {
+          bilinear(occ, au, av, px);
+          o = 1 + (px[0] / 255 - 1) * rec.occStrength;
+          s = 1 + (px[1] / 255 - 1) * rec.shadowStrength;
+        }
+        if (nrm) {
+          const pre = 1 + (bilinear(nrm, u, v, px2)[2] / 255 - 1) * rec.preStrength;
+          const mn = Math.min(pre, o);
+          o = hybrid ? mn + (pre * o - mn) * mn : pre * o;
+        }
+        ao[i] = srgbToLinF(clamp01(o));
+        sun[i] = clamp01(s);
+        if (occ || nrm) hasAO = true;
+      }
+    }
+    if (occ) { dilate(ao, inside, w, h, 8); dilate(sun, inside, w, h, 8); }
+    // O "sheen" do site (alfa da física) é só um fresnel fraco contra a luz; o sheen do glTF/Blender é bem mais largo e
+    // deixava os tecidos escuros acinzentados (testado lado a lado com o editor), então ele não é exportado.
+    return { rec, w, h, col, em, rough, metal, opac, ao, sun, inside, transparent, lit, hasAO, nrm, eye: !!eye };
+  }
+
+  // Imagens finais (linhas de cima para baixo, prontas para PNG)
+  function bakedColor(b, opts, withAlpha) {
+    const n = b.w * b.h, out = new Uint8ClampedArray(n * 4), useAO = opts.aoInColor && b.hasAO, useSun = opts.sunInColor;
+    for (let i = 0; i < n; i++) {
+      if (useAO || useSun) {
+        const f = (useAO ? b.ao[i] : 1) * (useSun ? b.sun[i] : 1);
+        out[i * 4] = lin2srgb(S2L[b.col[i * 3]] * f); out[i * 4 + 1] = lin2srgb(S2L[b.col[i * 3 + 1]] * f); out[i * 4 + 2] = lin2srgb(S2L[b.col[i * 3 + 2]] * f);
+      } else { out[i * 4] = b.col[i * 3]; out[i * 4 + 1] = b.col[i * 3 + 1]; out[i * 4 + 2] = b.col[i * 3 + 2]; }
+      out[i * 4 + 3] = withAlpha ? (b.inside[i] ? b.opac[i] : 255) : 255;
+    }
+    return { w: b.w, h: b.h, data: out };
+  }
+  function bakedGray(b, fn) {
+    const n = b.w * b.h, out = new Uint8ClampedArray(n * 4);
+    for (let i = 0; i < n; i++) { const g = fn(i); out[i * 4] = out[i * 4 + 1] = out[i * 4 + 2] = g; out[i * 4 + 3] = 255; }
+    return { w: b.w, h: b.h, data: out };
+  }
+  function bakedORM(b) { // glTF: R = oclusão (linear), G = rugosidade, B = metal
+    const n = b.w * b.h, out = new Uint8ClampedArray(n * 4);
+    for (let i = 0; i < n; i++) { out[i * 4] = Math.round(b.ao[i] * 255); out[i * 4 + 1] = b.rough[i]; out[i * 4 + 2] = b.metal[i]; out[i * 4 + 3] = 255; }
+    return { w: b.w, h: b.h, data: out };
+  }
+  function bakedEmissive(b) {
+    const n = b.w * b.h, out = new Uint8ClampedArray(n * 4);
+    for (let i = 0; i < n; i++) { out[i * 4] = b.em[i * 3]; out[i * 4 + 1] = b.em[i * 3 + 1]; out[i * 4 + 2] = b.em[i * 3 + 2]; out[i * 4 + 3] = 255; }
+    return { w: b.w, h: b.h, data: out };
+  }
+  // amostra (nearest) da cor final num uv da peça, para a cor por vértice do OBJ
+  function sampleBaked(img, u, v) {
+    const x = Math.max(0, Math.min(img.w - 1, Math.floor(u * img.w))), y = Math.max(0, Math.min(img.h - 1, Math.floor((1 - v) * img.h)));
+    const o = (y * img.w + x) * 4;
+    return [img.data[o], img.data[o + 1], img.data[o + 2]];
   }
 
   // ------------------------------------------------------------------ OBJ / MTL
@@ -581,70 +871,52 @@
 
     // ---- materiais e texturas
     toast('lendo texturas…', true); await nextFrame();
-    const mtl = [`# Herosaver ${VERSION} — ${name}`, ''];
-    const normalFiles = new Map();
+    const mtl = [`# Herosaver ${VERSION} — ${name}`,
+      '# map_Kd = cor' + (opts.aoInColor ? ' com a oclusão (AO) do editor' : '') + (opts.sunInColor ? ' e a sombra do sol' : '') + '; *_ao.png = oclusão separada (linear)', ''];
+    const normalFiles = new Map(), normalCache = new Map();
     let ti = 0;
     for (const rec of recs.values()) {
       ti++;
-      if (ti % 4 === 0) { toast(`texturas ${ti}/${recs.size}…`, true); await nextFrame(); }
-      const color = rd(rec.color), phys = rd(rec.phys), emis = rd(rec.emis);
-      rec.colorPx = color;
+      toast(`texturas ${ti}/${recs.size}…`, true); await nextFrame();
+      const b = await bakeMaterial(rec, rd, opts, normalCache);
+      const img = bakedColor(b, opts, false);
+      rec.bakedColor = img;
       const lines = [`newmtl ${rec.name}`];
-      let avg = [200, 200, 200];
-      if (color) {
-        const c = cropRegion(color, rec.region);
-        let sr = 0, sg = 0, sb = 0, sn = 0;
-        for (let i = 0; i < c.data.length; i += 4 * 7) { sr += c.data[i]; sg += c.data[i + 1]; sb += c.data[i + 2]; sn++; }
-        if (sn) avg = [sr / sn, sg / sn, sb / sn];
-        if (opts.textures) {
-          const png = await toPng(mapPixels(c, (r, g, b, a, o) => { o[0] = r; o[1] = g; o[2] = b; o[3] = 255; }));
-          files.push({ name: `textures/${rec.name}_color.png`, data: png });
+      let sr = 0, sg = 0, sb = 0, sn = 0;
+      for (let i = 0; i < b.w * b.h; i += 7) if (b.inside[i]) { sr += img.data[i * 4]; sg += img.data[i * 4 + 1]; sb += img.data[i * 4 + 2]; sn++; }
+      const avg = sn ? [sr / sn, sg / sn, sb / sn] : [200, 200, 200];
+      let rAvg = 0, mAvg = 0, cnt = 0;
+      for (let i = 0; i < b.w * b.h; i++) if (b.inside[i]) { rAvg += b.rough[i]; mAvg += b.metal[i]; cnt++; }
+      rAvg = cnt ? rAvg / cnt / 255 : 0.8; mAvg = cnt ? mAvg / cnt / 255 : 0;
+      const T = f => `textures/${rec.name}_${f}.png`;
+      lines.push('Ka 0 0 0', opts.textures ? 'Kd 1 1 1' : `Kd ${c3(avg[0])} ${c3(avg[1])} ${c3(avg[2])}`, 'Ks 0.5 0.5 0.5', 'Ns 100', 'illum 2');
+      if (opts.textures) {
+        files.push({ name: T('color'), data: await toPng(img) });
+        files.push({ name: T('roughness'), data: await toPng(bakedGray(b, i => b.rough[i])) });
+        files.push({ name: T('metallic'), data: await toPng(bakedGray(b, i => b.metal[i])) });
+        lines.push(`map_Kd ${T('color')}`, 'Pr 1', `map_Pr ${T('roughness')}`, 'Pm 1', `map_Pm ${T('metallic')}`);
+        if (b.hasAO) files.push({ name: T('ao'), data: await toPng(bakedGray(b, i => Math.round(b.ao[i] * 255))) });
+        if (b.transparent) {
+          files.push({ name: T('opacity'), data: await toPng(bakedGray(b, i => (b.inside[i] ? b.opac[i] : 255))) });
+          lines.push('d 1', `map_d ${T('opacity')}`);
         }
+        if (b.lit) {
+          files.push({ name: T('emissive'), data: await toPng(bakedEmissive(b)) });
+          lines.push('Ke 1 1 1', `map_Ke ${T('emissive')}`);
+        }
+      } else {
+        lines.push(`Pr ${rAvg.toFixed(3)}`, `Pm ${mAvg.toFixed(3)}`);
       }
-      lines.push('Ka 0 0 0', opts.textures && color ? 'Kd 1 1 1' : `Kd ${c3(avg[0])} ${c3(avg[1])} ${c3(avg[2])}`, 'Ks 0.04 0.04 0.04', 'Ns 100', 'illum 2');
-      if (opts.textures && color) lines.push(`map_Kd textures/${rec.name}_color.png`);
-      if (phys) {
-        const p = cropRegion(phys, rec.region);
-        let rough = 0, metal = 0, cnt = 0, transparent = false;
-        for (let i = 0; i < p.data.length; i += 4) {
-          if (p.data[i + 3] === 0) continue; // texel fora da ilha UV
-          rough += p.data[i]; metal += p.data[i + 1]; cnt++;
-          if (p.data[i + 2] < 250) transparent = true;
-        }
-        rough = cnt ? rough / cnt / 255 : 0.8; metal = cnt ? metal / cnt / 255 : 0;
-        if (opts.textures) {
-          files.push({ name: `textures/${rec.name}_roughness.png`, data: await toPng(mapPixels(p, (r, g, b, a, o) => { o[0] = o[1] = o[2] = r; o[3] = 255; })) });
-          files.push({ name: `textures/${rec.name}_metallic.png`, data: await toPng(mapPixels(p, (r, g, b, a, o) => { o[0] = o[1] = o[2] = g; o[3] = 255; })) });
-          lines.push('Pr 1', `map_Pr textures/${rec.name}_roughness.png`, 'Pm 1', `map_Pm textures/${rec.name}_metallic.png`);
-          if (transparent) {
-            files.push({ name: `textures/${rec.name}_opacity.png`, data: await toPng(mapPixels(p, (r, g, b, a, o) => { o[0] = o[1] = o[2] = b; o[3] = 255; })) });
-            lines.push('d 1', `map_d textures/${rec.name}_opacity.png`);
-          }
-        } else {
-          lines.push(`Pr ${rough.toFixed(3)}`, `Pm ${metal.toFixed(3)}`);
-        }
-      }
-      if (emis && opts.textures) {
-        const e = cropRegion(emis, rec.region);
-        let lit = false;
-        for (let i = 0; i < e.data.length && !lit; i += 4) if (e.data[i] > 3 || e.data[i + 1] > 3 || e.data[i + 2] > 3) lit = true;
-        if (lit) {
-          files.push({ name: `textures/${rec.name}_emissive.png`, data: await toPng(mapPixels(e, (r, g, b, a, o) => { o[0] = r; o[1] = g; o[2] = b; o[3] = 255; })) });
-          lines.push('Ke 1 1 1', `map_Ke textures/${rec.name}_emissive.png`);
-        }
-      }
-      if (opts.textures && rec.normal) {
-        let fname = normalFiles.get(rec.normal);
+      if (b.eye) lines.push('Pc 1', 'Pcr 0.03'); // córnea brilhante sobre a íris fosca, como o shader do olho
+      if (opts.textures && b.nrm) {
+        const key = rec.normal.uuid + '|' + rec.flipNormalMap; // L e R dividem o arquivo, mas o L é invertido
+        let fname = normalFiles.get(key);
         if (fname === undefined) {
-          fname = null;
-          const nt = rd(rec.normal);
-          if (nt && nt.w > 4 && nt.h > 4) {
-            fname = `textures/${rec.name}_normal.png`;
-            files.push({ name: fname, data: await toPng(convertNormalMap(flipRows(nt), rec.flipNormalMap)) });
-          }
-          normalFiles.set(rec.normal, fname);
+          fname = T('normal');
+          files.push({ name: fname, data: await toPng(convertNormalMap(flipRows(b.nrm), rec.flipNormalMap)) });
+          normalFiles.set(key, fname);
         }
-        if (fname) lines.push(`map_Bump -bm 1 ${fname}`, `norm ${fname}`);
+        lines.push(`map_Bump -bm 1 ${fname}`, `norm ${fname}`);
       }
       mtl.push(...lines, '');
     }
@@ -668,8 +940,8 @@
       for (let j = 0; j < k; j++) {
         const i = order[j];
         let col = '';
-        if (opts.vertexColors && m.uv && rec0 && rec0.colorPx) {
-          const s = sampleRegion(rec0.colorPx, rec0.region, m.uv[i * 2], m.uv[i * 2 + 1]);
+        if (opts.vertexColors && m.uv && rec0 && rec0.bakedColor) {
+          const s = sampleBaked(rec0.bakedColor, m.uv[i * 2], m.uv[i * 2 + 1]);
           col = ` ${c3(s[0])} ${c3(s[1])} ${c3(s[2])}`;
         }
         vline.push(`v ${f4(m.pos[i * 3])} ${f4(m.pos[i * 3 + 1])} ${f4(m.pos[i * 3 + 2])}${col}`);
@@ -728,6 +1000,348 @@
     return new Uint8Array(buf);
   }
 
+  // ------------------------------------------------------------------ RIG simplificado + GLB com animação idle
+  // O esqueleto do Hero Forge tem ~2000 ossos (a maioria só ajusta proporções: fat, twist, legLength...).
+  // Aqui eles são reduzidos a ~27 articulações humanoides e os pesos de pele são somados nelas.
+  // Cada articulação fica na posição do osso correspondente na pose atual, com rotação identidade
+  // (eixos do mundo: X direita, Y cima, Z frente) — assim a pose do personagem continua exatamente a da tela.
+  // [nome, pai, [nomes dos ossos do Hero Forge (sem o sufixo _NNNN_bind_jnt)]]
+  const RIG_DEF = [
+    ['hips', 'root', ['main_hips']],
+    ['spine', 'hips', ['main_spine_01']],
+    ['spine1', 'spine', ['main_spine_02']],
+    ['chest', 'spine1', ['main_spine_03']],
+    ['neck', 'chest', ['main_neck_01']],
+    ['head', 'neck', ['main_head_01']],
+    ['jaw', 'head', ['main_jaw_01']],
+    ['clavicle.L', 'chest', ['main_clavL_01']],
+    ['upperArm.L', 'clavicle.L', ['main_armL_01']],
+    ['lowerArm.L', 'upperArm.L', ['main_armL_02']],
+    ['hand.L', 'lowerArm.L', ['main_handL_01']],
+    ['clavicle.R', 'chest', ['main_clavR_01']],
+    ['upperArm.R', 'clavicle.R', ['main_armR_01']],
+    ['lowerArm.R', 'upperArm.R', ['main_armR_02']],
+    ['hand.R', 'lowerArm.R', ['main_handR_01']],
+    ['thigh.L', 'hips', ['main_legL_01', 'main_dgLeg_L_01']],
+    ['shin.L', 'thigh.L', ['main_legL_02', 'main_dgLeg_L_02']],
+    ['foot.L', 'shin.L', ['main_ankleL_01']],
+    ['toe.L', 'foot.L', ['main_toeL_01']],
+    ['thigh.R', 'hips', ['main_legR_01', 'main_dgLeg_R_01']],
+    ['shin.R', 'thigh.R', ['main_legR_02', 'main_dgLeg_R_02']],
+    ['foot.R', 'shin.R', ['main_ankleR_01']],
+    ['toe.R', 'foot.R', ['main_toeR_01']],
+  ];
+  const hfBase = n => String(n || '').replace(/_\d+_bind_jnt$/, '');
+
+  function buildRig(model) {
+    const withSkel = model.meshes.find(m => m.mesh.skeleton && m.skin);
+    if (!withSkel) throw new Error('esqueleto do personagem não encontrado.');
+    const bones = withSkel.mesh.skeleton.bones, nb = bones.length;
+    const index = new Map();
+    bones.forEach((b, i) => { if (b) index.set(b, i); });
+    const parentOf = i => { let o = bones[i].parent; while (o && !index.has(o)) o = o.parent; return o ? index.get(o) : -1; };
+    const depthMemo = new Int16Array(nb).fill(-1);
+    const depthOf = i => {
+      if (depthMemo[i] >= 0) return depthMemo[i];
+      const p = parentOf(i);
+      return (depthMemo[i] = p < 0 ? 0 : depthOf(p) + 1);
+    };
+    const byBase = new Map();
+    bones.forEach((b, i) => { if (!b) return; const k = hfBase(b.name); if (!byBase.has(k)) byBase.set(k, []); byBase.get(k).push(i); });
+
+    const E = model.E;
+    const joints = [{ name: 'root', parent: -1, pos: [0, 0, 0], aliases: [] }];
+    const jIndex = { root: 0 };
+    const keyOwner = new Map(); // índice do osso HF -> índice da articulação
+    for (const [name, parent, aliases] of RIG_DEF) {
+      const primary = (byBase.get(aliases[0]) || []).reduce((best, i) => best < 0 || depthOf(i) > depthOf(best) ? i : best, -1);
+      if (primary < 0 || !(parent in jIndex)) continue; // osso não existe neste esqueleto: o filho cai na articulação do pai
+      const w = bones[primary].matrixWorld.elements;
+      const pos = [E[0] * w[12] + E[4] * w[13] + E[8] * w[14] + E[12], E[1] * w[12] + E[5] * w[13] + E[9] * w[14] + E[13], E[2] * w[12] + E[6] * w[13] + E[10] * w[14] + E[14]];
+      jIndex[name] = joints.length;
+      joints.push({ name, parent: jIndex[parent], pos, aliases });
+      for (const a of aliases) for (const i of (byBase.get(a) || [])) keyOwner.set(i, jIndex[name]);
+      keyOwner.set(primary, jIndex[name]);
+    }
+    if (!('hips' in jIndex)) throw new Error('osso do quadril não encontrado.');
+    // chão: o root fica embaixo do quadril, na altura do plano da base
+    joints[0].pos = [joints[jIndex.hips].pos[0], 0, joints[jIndex.hips].pos[2]];
+
+    // dono de cada osso HF = articulação-chave mais próxima na árvore (sem ancestral-chave -> quadril)
+    const owner = new Int16Array(nb).fill(-2);
+    const ownerOf = i => {
+      const path = [];
+      let c = i;
+      while (c >= 0 && owner[c] === -2) {
+        if (keyOwner.has(c)) { owner[c] = keyOwner.get(c); break; }
+        path.push(c); c = parentOf(c);
+      }
+      const res = c < 0 ? jIndex.hips : owner[c];
+      for (const p of path) owner[p] = res;
+      return res;
+    };
+    for (let i = 0; i < nb; i++) if (bones[i]) ownerOf(i);
+
+    // pesos por vértice: soma por articulação, fica com as 4 maiores e normaliza
+    const stats = new Float64Array(joints.length), hfStats = new Float64Array(nb);
+    let nOver4 = 0;
+    for (const m of model.meshes) {
+      const J = new Uint8Array(m.n * 4), W = new Float32Array(m.n * 4);
+      if (m.skin) {
+        const K = m.skin.k, jj = new Int16Array(K), ww = new Float64Array(K);
+        for (let i = 0; i < m.n; i++) {
+          let cnt = 0;
+          for (let s = 0; s < K; s++) {
+            const w = m.skin.w[i * K + s];
+            if (!w) continue;
+            const bi = m.skin.idx[i * K + s];
+            const j = bi < nb && bones[bi] ? owner[bi] : jIndex.hips;
+            let q = 0;
+            while (q < cnt && jj[q] !== j) q++;
+            if (q === cnt) { jj[cnt] = j; ww[cnt] = 0; cnt++; }
+            ww[q] += w;
+            hfStats[bi] += w;
+          }
+          if (!cnt) { J[i * 4] = jIndex.hips; W[i * 4] = 1; continue; }
+          if (cnt > 4) nOver4++;
+          const order = Array.from({ length: cnt }, (_, q) => q).sort((a, b) => ww[b] - ww[a]).slice(0, 4);
+          let sum = 0;
+          for (const q of order) sum += ww[q];
+          order.forEach((q, k) => { J[i * 4 + k] = jj[q]; W[i * 4 + k] = ww[q] / sum; stats[jj[q]] += ww[q] / sum; });
+        }
+      } else {
+        let o = m.mesh.parent;
+        while (o && !index.has(o)) o = o.parent;
+        const j = o ? owner[index.get(o)] : (/back|cape|cloak|wing/i.test(m.key) ? jIndex.chest : jIndex.hips);
+        for (let i = 0; i < m.n; i++) { J[i * 4] = j; W[i * 4] = 1; }
+        m.rigidJoint = j;
+      }
+      m.rigJ = J; m.rigW = W;
+    }
+    return { joints, jIndex, stats, nOver4, hfStats, owner, boneNames: bones.map(b => b && b.name) };
+  }
+
+  // Ciclo de respiração/idle de `secs` segundos, em graus por eixo do mundo [rx, ry, rz] de cada articulação.
+  // Todas as ondas têm frequência inteira do ciclo, então o loop fecha sem salto.
+  function idlePose(ph, side, amount) {
+    const S = Math.sin, d = Math.PI / 180 * amount, o = {};
+    const hips = [0.5 * S(2 * ph + 0.4), 0.9 * S(ph + 2.0), 1.2 * S(ph + 1.0)];
+    o.hips = hips;
+    o.spine = [-0.9 * S(ph - 0.1), -0.5 * S(ph + 2.0), -0.8 * S(ph + 1.0)];
+    o.spine1 = [-1.3 * S(ph - 0.3), -0.4 * S(ph + 2.0), -0.4 * S(ph + 1.0)];
+    o.chest = [-2.0 * S(ph - 0.5), 0.3 * S(ph + 1.5), 0.2 * S(ph + 0.5)];
+    o.neck = [1.4 * S(ph - 0.9), 1.5 * S(ph - 0.7), 0.5 * S(ph + 1.5)];
+    o.head = [1.2 * S(2 * ph + 0.3) + 0.8 * S(ph - 1.3), 3.5 * S(ph - 0.9), 1.0 * S(ph + 1.5)];
+    for (const k of ['L', 'R']) {
+      const s = side[k];
+      o['clavicle.' + k] = [0.3 * S(ph - 0.5), 0, s * 2.0 * S(ph - 0.4)];
+      o['upperArm.' + k] = [1.8 * S(ph - 1.0), 0, s * 1.2 * S(ph - 0.7)];
+      o['lowerArm.' + k] = [-2.8 * S(ph - 1.5), 0, s * 0.6 * S(ph - 1.2)];
+      o['hand.' + k] = [3.2 * S(ph - 2.1), 0, s * 1.6 * S(ph - 2.0)];
+      o['thigh.' + k] = hips.map(v => -v);        // pernas ficam plantadas enquanto a bacia balança
+    }
+    for (const j in o) o[j] = o[j].map(v => v * d);
+    return o;
+  }
+
+  const qMul = (a, b) => [
+    a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+    a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+    a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+    a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2]];
+  const qEuler = (x, y, z) => { // gira em X, depois Y, depois Z (eixos do mundo); [x y z w]
+    const qx = [Math.sin(x / 2), 0, 0, Math.cos(x / 2)], qy = [0, Math.sin(y / 2), 0, Math.cos(y / 2)], qz = [0, 0, Math.sin(z / 2), Math.cos(z / 2)];
+    return qMul(qz, qMul(qy, qx));
+  };
+
+  // escala 0,01: 1 unidade do Hero Forge = 1 cm e o glTF é em metros (miniatura no tamanho real, ~3,7 cm)
+  const glbDefaults = { scale: 0.01, rig: false, animate: true, seconds: 4, fps: 30, amount: 1.5, zUp: false };
+
+  async function buildGlb(opts) {
+    toast('calculando a pose…', true); await nextFrame();
+    const model = buildModel(opts);
+    const name = characterName();
+    const rig = opts.rig ? buildRig(model) : null;
+    const joints = rig ? rig.joints : [], jIndex = rig ? rig.jIndex : {};
+    const recs = collectMaterials(model);
+    const cache = new Map();
+    const rd = tex => readTexture(tex, model.renderer, model.gl, cache);
+
+    // ---- buffer binário
+    const chunks = [], bufferViews = [], accessors = [];
+    let len = 0;
+    const addView = (u8, target) => {
+      const pad = (4 - (len % 4)) % 4;
+      if (pad) { chunks.push(new Uint8Array(pad)); len += pad; }
+      const v = { buffer: 0, byteOffset: len, byteLength: u8.byteLength };
+      if (target) v.target = target;
+      chunks.push(u8); len += u8.byteLength;
+      bufferViews.push(v);
+      return bufferViews.length - 1;
+    };
+    const bytes = ta => new Uint8Array(ta.buffer, ta.byteOffset, ta.byteLength);
+    const addAcc = (ta, componentType, type, count, target, extra) => {
+      accessors.push(Object.assign({ bufferView: addView(bytes(ta), target), componentType, count, type }, extra || {}));
+      return accessors.length - 1;
+    };
+    const FLOAT = 5126, UBYTE = 5121, UINT = 5125, ARRAY = 34962, ELEM = 34963;
+
+    // ---- materiais e texturas
+    const images = [], textures = [], materials = [], normalTex = new Map(), normalCache = new Map(), extUsed = new Set();
+    const addImage = async img => {
+      images.push({ bufferView: addView(await toPng(img)), mimeType: 'image/png' });
+      textures.push({ source: images.length - 1, sampler: 0 });
+      return { index: textures.length - 1 };
+    };
+    let ti = 0;
+    for (const rec of recs.values()) {
+      ti++;
+      toast(`texturas ${ti}/${recs.size}…`, true); await nextFrame();
+      const b = await bakeMaterial(rec, rd, opts, normalCache);
+      const mat = { name: rec.name, doubleSided: true, pbrMetallicRoughness: { baseColorFactor: [1, 1, 1, 1], metallicFactor: 1, roughnessFactor: 1 } };
+      const pbr = mat.pbrMetallicRoughness;
+      pbr.baseColorTexture = await addImage(bakedColor(b, opts, b.transparent)); // opacidade no alfa da cor
+      if (b.transparent) mat.alphaMode = 'BLEND';
+      // ORM numa textura só (o Godot reconhece e cria um ORMMaterial3D; o Blender separa os canais)
+      const orm = await addImage(bakedORM(b));
+      pbr.metallicRoughnessTexture = { index: orm.index };
+      if (b.hasAO) mat.occlusionTexture = { index: orm.index };
+      if (b.lit) { mat.emissiveTexture = await addImage(bakedEmissive(b)); mat.emissiveFactor = [1, 1, 1]; }
+      if (b.nrm) {
+        const key = rec.normal.uuid + '|' + rec.flipNormalMap;
+        if (!normalTex.has(key)) normalTex.set(key, await addImage(convertNormalMap(flipRows(b.nrm), rec.flipNormalMap)));
+        mat.normalTexture = { index: normalTex.get(key).index };
+      }
+      const ext = {};
+      if (b.eye) ext.KHR_materials_clearcoat = { clearcoatFactor: 1, clearcoatRoughnessFactor: 0.03 }; // córnea
+      if (Object.keys(ext).length) { mat.extensions = ext; Object.keys(ext).forEach(k => extUsed.add(k)); }
+      rec.glbMat = materials.length;
+      materials.push(mat);
+    }
+
+    // ---- malhas
+    toast('montando o GLB…', true); await nextFrame();
+    const meshes = [], nodes = [];
+    for (const j of joints) nodes.push({ name: j.name, translation: j.parent < 0 ? j.pos.slice() : j.pos.map((v, k) => v - joints[j.parent].pos[k]), children: [] });
+    joints.forEach((j, i) => { if (j.parent >= 0) nodes[j.parent].children.push(i); });
+    const jointCount = joints.length;
+    const meshNodes = [];
+    for (const m of model.meshes) {
+      const keep = new Int32Array(m.n).fill(-1);
+      let k = 0;
+      for (const t of m.tris) for (const i of t.idx) if (keep[i] < 0) keep[i] = k++;
+      if (!k) continue;
+      const order = new Int32Array(k);
+      for (let i = 0; i < m.n; i++) if (keep[i] >= 0) order[keep[i]] = i;
+      const P = new Float32Array(k * 3), N = new Float32Array(k * 3), UV = m.uv ? new Float32Array(k * 2) : null;
+      const Jt = rig ? new Uint8Array(k * 4) : null, Wt = rig ? new Float32Array(k * 4) : null;
+      const mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+      for (let q = 0; q < k; q++) {
+        const i = order[q];
+        for (let c = 0; c < 3; c++) {
+          const v = m.pos[i * 3 + c];
+          P[q * 3 + c] = v; N[q * 3 + c] = m.nrm[i * 3 + c];
+          if (v < mn[c]) mn[c] = v;
+          if (v > mx[c]) mx[c] = v;
+        }
+        if (UV) { UV[q * 2] = m.uv[i * 2]; UV[q * 2 + 1] = 1 - m.uv[i * 2 + 1]; }
+        if (rig) for (let c = 0; c < 4; c++) { Jt[q * 4 + c] = m.rigJ[i * 4 + c]; Wt[q * 4 + c] = m.rigW[i * 4 + c]; }
+      }
+      const attributes = {
+        POSITION: addAcc(P, FLOAT, 'VEC3', k, ARRAY, { min: mn, max: mx }),
+        NORMAL: addAcc(N, FLOAT, 'VEC3', k, ARRAY),
+      };
+      if (rig) {
+        attributes.JOINTS_0 = addAcc(Jt, UBYTE, 'VEC4', k, ARRAY);
+        attributes.WEIGHTS_0 = addAcc(Wt, FLOAT, 'VEC4', k, ARRAY);
+      }
+      if (UV) attributes.TEXCOORD_0 = addAcc(UV, FLOAT, 'VEC2', k, ARRAY);
+      const primitives = [];
+      for (const t of m.tris) {
+        if (!t.idx.length) continue;
+        const I = new Uint32Array(t.idx.length);
+        for (let q = 0; q < I.length; q++) I[q] = keep[t.idx[q]];
+        const rec = recs.get(t.mat);
+        const prim = { attributes, indices: addAcc(I, UINT, 'SCALAR', I.length, ELEM), mode: 4 };
+        if (rec && rec.glbMat !== undefined) prim.material = rec.glbMat;
+        primitives.push(prim);
+      }
+      meshes.push({ name: m.fin ? m.key + '_sub' : m.key, primitives });
+      const node = { name: m.fin ? m.key + '_sub' : m.key, mesh: meshes.length - 1 };
+      if (rig) node.skin = 0;
+      meshNodes.push(node);
+    }
+
+    // ---- skin (matrizes de bind = inversa da translação de cada articulação)
+    let skin = null;
+    if (rig) {
+      const ibm = new Float32Array(jointCount * 16);
+      joints.forEach((j, i) => { ibm.set([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -j.pos[0], -j.pos[1], -j.pos[2], 1], i * 16); });
+      skin = { name: 'Armature', skeleton: 0, joints: joints.map((_, i) => i), inverseBindMatrices: addAcc(ibm, FLOAT, 'MAT4', jointCount) };
+    }
+
+    // ---- animação idle
+    const animations = [];
+    let frames = 0;
+    if (rig && opts.animate) {
+      const fps = opts.fps, secs = opts.seconds;
+      frames = Math.round(fps * secs);
+      const xs = joints.map(j => j.pos[0]);
+      const side = { L: Math.sign(xs[jIndex['upperArm.L']] || 1) || 1, R: Math.sign(xs[jIndex['upperArm.R']] || -1) || -1 };
+      const times = new Float32Array(frames + 1);
+      for (let f = 0; f <= frames; f++) times[f] = f / fps;
+      const timeAcc = addAcc(times, FLOAT, 'SCALAR', frames + 1, null, { min: [0], max: [times[frames]] });
+      const tracks = new Map();
+      for (let f = 0; f <= frames; f++) {
+        const pose = idlePose(2 * Math.PI * (f % frames) / frames, side, opts.amount);
+        for (const jn in pose) {
+          if (!(jn in jIndex)) continue;
+          if (!tracks.has(jn)) tracks.set(jn, new Float32Array((frames + 1) * 4));
+          tracks.get(jn).set(qEuler(...pose[jn]), f * 4);
+        }
+      }
+      const samplers = [], channels = [];
+      for (const [jn, arr] of tracks) {
+        samplers.push({ input: timeAcc, output: addAcc(arr, FLOAT, 'VEC4', frames + 1), interpolation: 'LINEAR' });
+        channels.push({ sampler: samplers.length - 1, target: { node: jIndex[jn], path: 'rotation' } });
+      }
+      animations.push({ name: 'Idle', samplers, channels });
+    }
+
+    const jointNodes = nodes.map(n => (n.children.length ? n : { name: n.name, translation: n.translation }));
+    const allNodes = jointNodes.concat(meshNodes);
+    const gltf = {
+      asset: { version: '2.0', generator: `Herosaver ${VERSION}` },
+      scene: 0,
+      scenes: [{ name: name, nodes: (rig ? [0] : []).concat(meshNodes.map((_, i) => jointCount + i)) }],
+      nodes: allNodes, meshes, materials, textures, images,
+      // CLAMP: as ilhas UV de cada peça ficam dentro de [0,1]; repetir puxaria a borda oposta nos mipmaps
+      samplers: [{ magFilter: 9729, minFilter: 9987, wrapS: 33071, wrapT: 33071 }],
+      accessors, bufferViews, buffers: [{ byteLength: (len + 3) & ~3 }],
+    };
+    if (skin) gltf.skins = [skin];
+    if (extUsed.size) gltf.extensionsUsed = [...extUsed];
+    if (animations.length) gltf.animations = animations;
+    if (!textures.length) { delete gltf.textures; delete gltf.images; delete gltf.samplers; }
+    if (!materials.length) delete gltf.materials;
+
+    // ---- contêiner GLB
+    const enc = new TextEncoder();
+    let json = enc.encode(JSON.stringify(gltf));
+    const jpad = (4 - (json.length % 4)) % 4;
+    if (jpad) { const j2 = new Uint8Array(json.length + jpad).fill(0x20); j2.set(json); json = j2; }
+    const binLen = (len + 3) & ~3;
+    const total = 12 + 8 + json.length + 8 + binLen;
+    const out = new Uint8Array(total), dv = new DataView(out.buffer);
+    dv.setUint32(0, 0x46546C67, true); dv.setUint32(4, 2, true); dv.setUint32(8, total, true);
+    dv.setUint32(12, json.length, true); dv.setUint32(16, 0x4E4F534A, true); out.set(json, 20);
+    let o = 20 + json.length;
+    dv.setUint32(o, binLen, true); dv.setUint32(o + 4, 0x004E4942, true); o += 8;
+    for (const c of chunks) { out.set(c, o); o += c.length; }
+    log(`GLB: ${joints.length} articulações, ${meshes.length} malhas, ${materials.length} materiais, ${images.length} texturas, ${frames} quadros` + (rig ? `; vértices com >4 articulações: ${rig.nOver4}` : ''));
+    return { name, glb: out, rig, triCount: model.triCount, frames, model };
+  }
+
   // ------------------------------------------------------------------ ZIP (sem dependências)
   const CRC = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
   const crc32 = d => { let c = 0xFFFFFFFF; for (let i = 0; i < d.length; i++) c = CRC[(c ^ d[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; };
@@ -777,8 +1391,170 @@
     setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 30000);
   }
 
+  // ------------------------------------------------------------------ qualidade máxima: UHD + oclusão 4K só durante o export
+  // O editor tem um modo "uhdTextures" (texturas com o dobro da resolução, as mesmas peças) e calcula a oclusão num
+  // atlas próprio, de 512 px na maioria dos computadores. O export liga os dois, espera o editor refazer tudo,
+  // exporta e devolve o editor como estava.
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  async function waitUntil(cond, ms, what) {
+    const t0 = performance.now();
+    while (!cond()) {
+      if (performance.now() - t0 > ms) { warn('tempo esgotado esperando ' + what); return false; }
+      await sleep(200);
+    }
+    return true;
+  }
+  function editorIdle() {
+    const d = CK.display, cb = d.colorBake;
+    return d.finished !== false && d.resourcesReady !== false && !(CK.character && CK.character.isLoading && CK.character.isLoading()) &&
+      !(cb && cb.needsRefresh && Object.keys(cb.needsRefresh).length);
+  }
+  async function waitStable(ms, what) { // ocioso em 5 checagens seguidas (~1 s)
+    let ok = 0;
+    const t0 = performance.now();
+    while (ok < 5) {
+      if (performance.now() - t0 > ms) { warn('tempo esgotado esperando ' + what); return false; }
+      ok = editorIdle() ? ok + 1 : 0;
+      await sleep(200);
+    }
+    return true;
+  }
+  // A oclusão ambiente (canal R) e a sombra do sol (canal G) são dois passos que escrevem no mesmo alvo; ao mudar o
+  // tamanho, os dois precisam ser refeitos juntos, senão a sombra do sol do editor some.
+  const occlusionPasses = d => [d.sunOcclusion, d.occlusion].filter(p => p && p.initializeIO);
+  function reinitOcclusion(d, width, samples) {
+    for (const p of occlusionPasses(d)) {
+      p.requestedOcclusionWidth = width;
+      if (samples && samples.has(p)) p.sampleCount = samples.get(p);
+      p.initializeIO(d);
+      p.needsRefresh = true;
+    }
+  }
+  async function boostQuality() {
+    const CK = editor(), S = CK.Settings, d = CK.display, passes = occlusionPasses(d);
+    const st = { uhd: !!S.uhdTextures, occ: passes.map(p => [p, p.requestedOcclusionWidth || p.occlusionWidth, p.sampleCount]), changed: false };
+    if (!S.uhdTextures && CK.character && CK.character.changeSettings) {
+      toast('qualidade máxima: carregando texturas UHD…', true);
+      const w0 = d.atlas ? d.atlas.width : 0;
+      S.uhdTextures = true; st.changed = true;
+      CK.character.changeSettings({});
+      await waitUntil(() => d.atlas && d.atlas.width > w0, 8000, 'atlas UHD');
+      await waitStable(90000, 'texturas UHD');
+    }
+    if (passes.length && S.occlusion !== false) {
+      toast('qualidade máxima: recalculando a oclusão em 4K…', true);
+      const ra = d.modded && d.modded.resourceAtlas;
+      const more = new Map(passes.map(p => [p, Math.max(p.sampleCount || 0, p === d.sunOcclusion ? 256 : 4096)]));
+      reinitOcclusion(d, Math.min(4096, (ra && ra.width) || 4096), more);
+      st.changed = true;
+      await waitUntil(() => passes.some(p => p._isDone === false), 4000, 'início da oclusão'); // recomeça em ~0,2 s
+      await waitUntil(() => passes.every(p => p._isDone !== false) && editorIdle(), 180000, 'oclusão 4K');
+      await sleep(300);
+    }
+    return st;
+  }
+  function restoreQuality(st) {
+    if (!st || !st.changed) return;
+    try {
+      const S = CK.Settings, d = CK.display;
+      if (!st.uhd && S.uhdTextures) { S.uhdTextures = false; CK.character.changeSettings({}); }
+      if (st.occ.length) {
+        // refaz a oclusão e a sombra do sol no tamanho original depois que o atlas volta ao normal
+        waitStable(60000, 'editor').then(() => {
+          try {
+            for (const [p, w, n] of st.occ) { p.requestedOcclusionWidth = w || S.occlusionTextureSize || 512; if (n) p.sampleCount = n; p.initializeIO(d); p.needsRefresh = true; }
+          } catch (e) { warn('falha ao refazer a oclusão do editor', e); }
+        });
+      }
+    } catch (e) { warn('falha ao devolver o editor à qualidade normal', e); }
+  }
+  async function withQuality(opts, fn) {
+    if (!opts.maxQuality) return fn();
+    const st = await boostQuality();
+    try { return await fn(); } finally { restoreQuality(st); }
+  }
+
+  // ------------------------------------------------------------------ luz do editor -> HDRI (.hdr, Radiance)
+  // Decodifica o mapa de ambiente do editor (lat-long RGBD com mipmaps empacotados, como no shader do site),
+  // aplica cor/intensidade/saturação da luz e acrescenta o sol (luz direcional) como um disco de 2,5°.
+  // Orientação do Blender, no referencial do modelo exportado: importe o modelo e use o .hdr no World sem girar.
+  function buildHdr() {
+    const CK = editor(), L = CK.environment && CK.environment.lighting, el = L && L.envLight;
+    if (!el || !el.map) throw new Error('mapa de ambiente do editor não encontrado.');
+    const { renderer, gl } = glOf(CK);
+    const env = readTexture(el.map, renderer, gl, new Map());
+    if (!env) throw new Error('não consegui ler o mapa de ambiente do editor.');
+    const reg = el.mapRegion ? [el.mapRegion.x, el.mapRegion.y, el.mapRegion.z, el.mapRegion.w] : [0, 0, 1, 1];
+    const c = el.color || { r: 1, g: 1, b: 1 }, k = typeof el.intensity === 'number' ? el.intensity : 1;
+    const scale = [c.r * k, c.g * k, c.b * k], sat = typeof el.saturationScale === 'number' ? el.saturationScale : 1;
+    const rc = Math.cos(-(el.rotateY || 0)), rs = Math.sin(-(el.rotateY || 0));
+    const E = exportFrame(CK, { scale: 1, zUp: false }), Ei = M4.inv(E);
+    const W = Math.max(512, Math.min(2048, 2 * (el.mapWidth || 512))), H = W / 2;
+    const rgb = new Float32Array(W * H * 3), px = [0, 0, 0, 0];
+    const dirOf = (x, r) => { // pixel -> direção no Blender -> direção no referencial do modelo (Y para cima)
+      const u = (x + 0.5) / W, v = 1 - (r + 0.5) / H;
+      const ph = (0.5 - u) * 2 * Math.PI, th = (v - 0.5) * Math.PI;
+      const bx = Math.cos(th) * Math.cos(ph), by = Math.cos(th) * Math.sin(ph), bz = Math.sin(th);
+      return [bx, bz, -by];
+    };
+    for (let r = 0; r < H; r++) for (let x = 0; x < W; x++) {
+      const g = dirOf(x, r);
+      let wx = Ei[0] * g[0] + Ei[4] * g[1] + Ei[8] * g[2], wy = Ei[1] * g[0] + Ei[5] * g[1] + Ei[9] * g[2], wz = Ei[2] * g[0] + Ei[6] * g[1] + Ei[10] * g[2];
+      const l = Math.hypot(wx, wy, wz) || 1; wx /= l; wy /= l; wz /= l;
+      const rx = rc * wx + rs * wz, rz = -rs * wx + rc * wz; // RotateY(-rotateY) do shader
+      const uh = 1 - (Math.atan2(rx, rz) + Math.PI) / (2 * Math.PI), vh = (Math.asin(Math.max(-1, Math.min(1, wy))) + Math.PI / 2) / Math.PI;
+      bilinear(env, reg[0] + uh * reg[2], reg[1] + (vh * 0.5 + 0.5) * reg[3], px); // mip 0
+      const dd = Math.max(px[3] / 255, 1 / 255), f = 128 / 255 / dd / 255;
+      let R = px[0] * f * scale[0], G = px[1] * f * scale[1], B = px[2] * f * scale[2];
+      const m = (R + G + B) / 3;
+      R = m + (R - m) * sat; G = m + (G - m) * sat; B = m + (B - m) * sat;
+      const o = (r * W + x) * 3;
+      rgb[o] = Math.max(0, R); rgb[o + 1] = Math.max(0, G); rgb[o + 2] = Math.max(0, B);
+    }
+    const sun = L.sunlight;
+    if (sun && sun.intensity > 0 && sun.visible !== false) {
+      sun.updateMatrixWorld && sun.updateMatrixWorld(true);
+      const p = sun.matrixWorld ? sun.matrixWorld.elements : null, t = sun.target && sun.target.matrixWorld ? sun.target.matrixWorld.elements : null;
+      let dx = p ? p[12] - (t ? t[12] : 0) : 1, dy = p ? p[13] - (t ? t[13] : 0) : 1, dz = p ? p[14] - (t ? t[14] : 0) : 1;
+      let gx = E[0] * dx + E[4] * dy + E[8] * dz, gy = E[1] * dx + E[5] * dy + E[9] * dz, gz = E[2] * dx + E[6] * dy + E[10] * dz;
+      const l = Math.hypot(gx, gy, gz) || 1; gx /= l; gy /= l; gz /= l;
+      const cosR = Math.cos(2.5 * Math.PI / 180), hit = [];
+      let omega = 0;
+      for (let r = 0; r < H; r++) for (let x = 0; x < W; x++) {
+        const g = dirOf(x, r);
+        if (g[0] * gx + g[1] * gy + g[2] * gz < cosR) continue;
+        const th = (0.5 - (r + 0.5) / H) * Math.PI;
+        const om = (2 * Math.PI / W) * (Math.PI / H) * Math.cos(th);
+        omega += om; hit.push(r * W + x);
+      }
+      const sc = sun.color || { r: 1, g: 1, b: 1 }, Es = sun.intensity * Math.PI; // three.js (luz não física): irradiância = cor * intensidade * PI
+      if (omega > 0) for (const i of hit) { rgb[i * 3] += sc.r * Es / omega; rgb[i * 3 + 1] += sc.g * Es / omega; rgb[i * 3 + 2] += sc.b * Es / omega; }
+    }
+    // Radiance RGBE com RLE "sem repetições" (blocos literais), aceito por Blender, Godot, stb_image etc.
+    const head = new TextEncoder().encode(`#?RADIANCE\n# Herosaver ${VERSION}: luz do editor do Hero Forge\nFORMAT=32-bit_rle_rgbe\n\n-Y ${H} +X ${W}\n`);
+    const line = new Uint8Array(W * 4), chunks = [head];
+    for (let r = 0; r < H; r++) {
+      for (let x = 0; x < W; x++) {
+        const o = (r * W + x) * 3, R = rgb[o], G = rgb[o + 1], B = rgb[o + 2], m = Math.max(R, G, B);
+        if (m < 1e-32) { line[x] = line[W + x] = line[2 * W + x] = line[3 * W + x] = 0; continue; }
+        let e = Math.floor(Math.log2(m)) + 1, f = m / Math.pow(2, e);
+        if (f >= 1) { f /= 2; e++; } else if (f < 0.5) { f *= 2; e--; }
+        const s = 256 / Math.pow(2, e);
+        line[x] = Math.min(255, R * s); line[W + x] = Math.min(255, G * s); line[2 * W + x] = Math.min(255, B * s); line[3 * W + x] = e + 128;
+      }
+      const enc = [2, 2, W >> 8, W & 255];
+      for (let ch = 0; ch < 4; ch++) for (let x = 0; x < W; x += 128) {
+        const n = Math.min(128, W - x);
+        enc.push(n);
+        for (let q = 0; q < n; q++) enc.push(line[ch * W + x + q]);
+      }
+      chunks.push(Uint8Array.from(enc));
+    }
+    return { name: characterName(), data: new Blob(chunks, { type: 'image/vnd.radiance' }), w: W, h: H };
+  }
+
   // ------------------------------------------------------------------ API pública
-  const defaults = { scale: 10, base: true, noPrint: false, textures: true, vertexColors: true, normals: true, zUp: false };
+  const defaults = { scale: 10, base: true, noPrint: false, textures: true, vertexColors: true, normals: true, zUp: false, maxQuality: true, aoInColor: true, sunInColor: false };
   const withDefaults = (o, extra) => Object.assign({}, defaults, extra || {}, typeof o === 'object' && o ? o : {});
 
   async function run(label, fn) {
@@ -794,7 +1570,7 @@
   window.saveObj = opts => run('obj', async () => {
     const o = withDefaults(opts);
     const t0 = performance.now();
-    const res = await buildObjFiles(o);
+    const res = await withQuality(o, () => buildObjFiles(o));
     toast('compactando…', true); await nextFrame();
     const zip = await makeZip(res.files);
     download(zip, `${res.name}.zip`);
@@ -814,6 +1590,26 @@
     return { name, bytes: data.length };
   });
 
+  // GLB estático por padrão; saveGlb({ rig: true }) inclui o esqueleto simplificado e a animação idle.
+  window.saveGlb = opts => run('glb', async () => {
+    const o = withDefaults(opts, glbDefaults);
+    const t0 = performance.now();
+    const res = await withQuality(o, () => buildGlb(o));
+    const file = `${res.name}${res.rig ? '_rig' : ''}.glb`;
+    download(new Blob([res.glb], { type: 'model/gltf-binary' }), file);
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    toast(`pronto: ${file} (${(res.glb.length / 1048576).toFixed(1)} MB, ${res.triCount} triângulos${res.rig ? `, ${res.rig.joints.length} articulações` : ''}, ${secs}s)`);
+    return { name: res.name, bytes: res.glb.length, joints: res.rig ? res.rig.joints.length : 0, triangles: res.triCount };
+  });
+
+  window.saveHdr = () => run('hdr', async () => {
+    toast('lendo a luz do editor…', true); await nextFrame();
+    const res = buildHdr();
+    download(res.data, `${res.name}_luz_editor.hdr`);
+    toast(`pronto: ${res.name}_luz_editor.hdr (${res.w}×${res.h})`);
+    return { name: res.name, bytes: res.data.size };
+  });
+
   window.saveJson = () => run('json', async () => {
     const CK = editor();
     const name = characterName();
@@ -825,7 +1621,7 @@
   const STORE = 'herosaver2.options';
   const PANEL_ID = 'herosaver2-panel';
   const loadPrefs = () => {
-    const d = { format: 'obj', base: true, textures: true, vertexColors: true, normals: true, zUp: false, noPrint: false, units: 'mm' };
+    const d = { format: 'obj', base: true, textures: true, vertexColors: true, normals: true, zUp: false, noPrint: false, units: 'mm', maxQuality: true, aoInColor: true, sunInColor: false };
     try { return Object.assign(d, JSON.parse(localStorage.getItem(STORE) || '{}')); } catch (e) { return d; }
   };
   const savePrefs = p => { try { localStorage.setItem(STORE, JSON.stringify(p)); } catch (e) { /* */ } };
@@ -843,8 +1639,14 @@
     .body { padding: 10px 12px 12px; display: grid; gap: 10px; }
     .name { color: #bbb; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .name strong { color: #fff; }
-    .seg { display: grid; grid-template-columns: 1fr 1fr; background: #111; border-radius: 7px; padding: 3px; gap: 3px; }
-    .seg label { text-align: center; padding: 6px 0; border-radius: 5px; cursor: pointer; color: #bbb; }
+    .seg { display: grid; grid-template-columns: repeat(4, 1fr); background: #111; border-radius: 7px; padding: 3px; gap: 3px; }
+    .seg label { text-align: center; padding: 6px 0; border-radius: 5px; cursor: pointer; color: #bbb; white-space: nowrap; font-size: 12px; }
+    .note { color: #999; font-size: 12px; }
+    .sec { all: unset; box-sizing: border-box; width: 100%; text-align: center; cursor: pointer; padding: 7px 0; border-radius: 7px;
+           background: #2a2a2a; color: #ddd; font-size: 12px; border: 1px solid #3a3a3a; }
+    .sec:hover { background: #333; color: #fff; }
+    .sec[disabled] { color: #777; cursor: progress; }
+    [hidden] { display: none !important; }
     .seg input { display: none; }
     .seg label:has(input:checked) { background: #3c3c3c; color: #fff; }
     fieldset { border: 0; margin: 0; padding: 0; display: grid; gap: 6px; }
@@ -880,26 +1682,35 @@
         <div class="body">
           <div class="name">Personagem: <strong></strong></div>
           <div class="seg">
-            <label><input type="radio" name="fmt" value="obj">OBJ + texturas</label>
-            <label><input type="radio" name="fmt" value="stl">STL</label>
+            <label title="Wavefront OBJ + MTL + texturas PBR, num .zip"><input type="radio" name="fmt" value="obj">OBJ</label>
+            <label title="glTF binário: um arquivo com malha e materiais PBR"><input type="radio" name="fmt" value="glb">GLB</label>
+            <label title="GLB com esqueleto simplificado e animação idle"><input type="radio" name="fmt" value="glbRig">GLB+rig</label>
+            <label title="Só a geometria, para impressão"><input type="radio" name="fmt" value="stl">STL</label>
           </div>
           <fieldset class="common">
             <label class="row"><input type="checkbox" data-k="base"><span>Incluir a base</span></label>
-            <label class="row"><input type="checkbox" data-k="zUp"><span>Z para cima <small>(impressão / fatiador)</small></span></label>
+            <label class="row" data-for="obj stl"><input type="checkbox" data-k="zUp"><span>Z para cima <small>(impressão / fatiador)</small></span></label>
             <label class="row"><input type="checkbox" data-k="noPrint"><span>Peças não imprimíveis <small>(efeitos etc.)</small></span></label>
           </fieldset>
-          <fieldset class="objonly">
+          <fieldset class="look" data-for="obj glb glbRig">
+            <label class="row"><input type="checkbox" data-k="maxQuality"><span>Qualidade máxima <small>(texturas UHD + oclusão 4K)</small></span></label>
+            <label class="row"><input type="checkbox" data-k="aoInColor"><span>Oclusão na cor <small>(sombras de contato do editor)</small></span></label>
+            <label class="row"><input type="checkbox" data-k="sunInColor"><span>Sombra do sol na cor</span></label>
+          </fieldset>
+          <fieldset class="objonly" data-for="obj">
             <label class="row"><input type="checkbox" data-k="textures"><span>Texturas <small>(cor, metal, rugosidade, normal)</small></span></label>
             <label class="row"><input type="checkbox" data-k="vertexColors"><span>Cor por vértice</span></label>
             <label class="row"><input type="checkbox" data-k="normals"><span>Normais suaves</span></label>
           </fieldset>
-          <select class="units" title="Unidade">
+          <select class="units" title="Unidade" data-for="obj stl">
             <option value="mm">Milímetros (base de 25 mm)</option>
             <option value="cm">Centímetros (= unidades do Hero Forge)</option>
             <option value="in">Polegadas</option>
           </select>
+          <div class="note" data-for="glb glbRig">Tamanho real da miniatura, em metros (Y para cima).</div>
           <hr>
           <button class="go">Exportar</button>
+          <button class="sec hdr" title="Mapa de ambiente do editor + sol, em HDR, para o World do Blender ou o céu do Godot">Baixar a luz do editor (.hdr)</button>
           <div class="st" aria-live="polite"></div>
         </div>
       </div>`;
@@ -908,12 +1719,14 @@
     $$('input[name=fmt]').forEach(r => { r.checked = r.value === prefs.format; });
     $$('input[data-k]').forEach(c => { c.checked = !!prefs[c.dataset.k]; });
     $('.units').value = prefs.units;
+    if (!$('input[name=fmt]:checked')) $('input[name=fmt][value=obj]').checked = true;
+    const LABEL = { obj: 'Exportar OBJ (.zip)', glb: 'Exportar GLB', glbRig: 'Exportar GLB com rig', stl: 'Exportar STL' };
     const sync = () => {
       prefs.format = $('input[name=fmt]:checked').value;
       $$('input[data-k]').forEach(c => { prefs[c.dataset.k] = c.checked; });
       prefs.units = $('.units').value;
-      $('.objonly').disabled = prefs.format !== 'obj';
-      $('.go').textContent = prefs.format === 'obj' ? 'Exportar OBJ (.zip)' : 'Exportar STL';
+      $$('[data-for]').forEach(el => { el.hidden = !el.dataset.for.split(' ').includes(prefs.format); });
+      $('.go').textContent = LABEL[prefs.format] || 'Exportar';
       savePrefs(prefs);
     };
     // STL costuma ir para o fatiador: ao trocar para STL liga Z para cima, ao voltar para OBJ desliga
@@ -926,14 +1739,27 @@
       st.className = 'st' + (/^erro/.test(msg) ? ' err' : /^pronto/.test(msg) ? ' ok' : '');
       return true;
     };
-    const go = $('.go');
+    const go = $('.go'), hdr = $('.hdr');
     go.addEventListener('click', async () => {
       if (go.disabled) return;
-      go.disabled = true;
+      go.disabled = true; hdr.disabled = true;
       const scale = { mm: 10, cm: 1, in: 10 / 25.4 }[prefs.units] || 10;
-      const opts = { scale, base: prefs.base, zUp: prefs.zUp, noPrint: prefs.noPrint, textures: prefs.textures, vertexColors: prefs.vertexColors, normals: prefs.normals };
-      try { await (prefs.format === 'stl' ? window.saveStl(opts) : window.saveObj(opts)); } catch (e) { /* já mostrado */ }
-      go.disabled = false;
+      const look = { maxQuality: prefs.maxQuality, aoInColor: prefs.aoInColor, sunInColor: prefs.sunInColor };
+      const opts = Object.assign({ scale, base: prefs.base, zUp: prefs.zUp, noPrint: prefs.noPrint, textures: prefs.textures, vertexColors: prefs.vertexColors, normals: prefs.normals }, look);
+      const glbOpts = Object.assign({ base: prefs.base, noPrint: prefs.noPrint }, look);
+      try {
+        if (prefs.format === 'stl') await window.saveStl(opts);
+        else if (prefs.format === 'glb') await window.saveGlb(glbOpts);
+        else if (prefs.format === 'glbRig') await window.saveGlb(Object.assign({ rig: true }, glbOpts));
+        else await window.saveObj(opts);
+      } catch (e) { /* já mostrado */ }
+      go.disabled = false; hdr.disabled = false;
+    });
+    hdr.addEventListener('click', async () => {
+      if (hdr.disabled) return;
+      hdr.disabled = true;
+      try { await window.saveHdr(); } catch (e) { /* já mostrado */ }
+      hdr.disabled = false;
     });
     $('.x').addEventListener('click', closePanel);
     host._onKey = e => { if (e.key === 'Escape') closePanel(); };
@@ -953,7 +1779,8 @@
   window.Herosaver = {
     version: VERSION, open: openPanel, close: closePanel,
     // para depuração / testes
-    buildObjFiles: o => buildObjFiles(withDefaults(o)), buildStl: o => buildStl(withDefaults(o, { zUp: true })), makeZip,
+    buildObjFiles: o => buildObjFiles(withDefaults(o)), buildStl: o => buildStl(withDefaults(o, { zUp: true })), buildGlb: o => buildGlb(withDefaults(o, glbDefaults)), makeZip,
+    buildHdr, boostQuality, restoreQuality, withQuality: (o, fn) => withQuality(withDefaults(o), fn),
   };
-  log(`v${VERSION} carregado — Herosaver.open() abre o painel; ou use saveObj(), saveStl(), saveJson()`);
+  log(`v${VERSION} carregado — Herosaver.open() abre o painel; ou use saveObj(), saveGlb(), saveStl(), saveHdr(), saveJson()`);
 })();
