@@ -1430,15 +1430,22 @@
       p.needsRefresh = true;
     }
   }
+  // Estado original do editor, guardado no primeiro export e só apagado quando a restauração termina
+  // (dois exports seguidos não podem tomar o estado "turbinado" do primeiro como original).
+  let saved = null, restoreToken = 0;
   async function boostQuality() {
     const CK = editor(), S = CK.Settings, d = CK.display, passes = occlusionPasses(d);
-    const st = { uhd: !!S.uhdTextures, occ: passes.map(p => [p, p.requestedOcclusionWidth || p.occlusionWidth, p.sampleCount]), changed: false };
-    if (!S.uhdTextures && CK.character && CK.character.changeSettings) {
+    restoreToken++; // cancela uma restauração ainda pendente
+    if (!saved || saved.display !== d) {
+      saved = { display: d, uhd: !!S.uhdTextures, atlasW: d.atlas ? d.atlas.width : 0, occ: passes.map(p => [p, p.requestedOcclusionWidth || p.occlusionWidth, p.sampleCount]) };
+    }
+    const st = { changed: false };
+    if (!saved.uhd && CK.character && CK.character.changeSettings) {
       toast('qualidade máxima: carregando texturas UHD…', true);
-      const w0 = d.atlas ? d.atlas.width : 0;
-      S.uhdTextures = true; st.changed = true;
-      CK.character.changeSettings({});
-      await waitUntil(() => d.atlas && d.atlas.width > w0, 8000, 'atlas UHD');
+      const target = Math.min(2 * saved.atlasW, S.textureWidthMax || 4096);
+      if (!S.uhdTextures) { S.uhdTextures = true; CK.character.changeSettings({}); }
+      st.changed = true;
+      await waitUntil(() => d.atlas && d.atlas.width >= target, 8000, 'atlas UHD');
       await waitStable(90000, 'texturas UHD');
     }
     if (passes.length && S.occlusion !== false) {
@@ -1454,18 +1461,19 @@
     return st;
   }
   function restoreQuality(st) {
-    if (!st || !st.changed) return;
+    if (!st || !st.changed || !saved) return;
+    const token = ++restoreToken, orig = saved;
     try {
-      const S = CK.Settings, d = CK.display;
-      if (!st.uhd && S.uhdTextures) { S.uhdTextures = false; CK.character.changeSettings({}); }
-      if (st.occ.length) {
-        // refaz a oclusão e a sombra do sol no tamanho original depois que o atlas volta ao normal
-        waitStable(60000, 'editor').then(() => {
-          try {
-            for (const [p, w, n] of st.occ) { p.requestedOcclusionWidth = w || S.occlusionTextureSize || 512; if (n) p.sampleCount = n; p.initializeIO(d); p.needsRefresh = true; }
-          } catch (e) { warn('falha ao refazer a oclusão do editor', e); }
-        });
-      }
+      const S = CK.Settings, d = orig.display;
+      if (!orig.uhd && S.uhdTextures) { S.uhdTextures = false; CK.character.changeSettings({}); }
+      // refaz a oclusão e a sombra do sol no tamanho original depois que o atlas volta ao normal
+      waitStable(60000, 'editor').then(() => {
+        if (token !== restoreToken) return; // outro export começou: ele restaura no fim
+        try {
+          for (const [p, w, n] of orig.occ) { p.requestedOcclusionWidth = w || S.occlusionTextureSize || 512; if (n) p.sampleCount = n; p.initializeIO(d); p.needsRefresh = true; }
+        } catch (e) { warn('falha ao refazer a oclusão do editor', e); }
+        if (saved === orig) saved = null;
+      });
     } catch (e) { warn('falha ao devolver o editor à qualidade normal', e); }
   }
   async function withQuality(opts, fn) {
